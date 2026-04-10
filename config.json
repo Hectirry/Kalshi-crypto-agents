@@ -1,0 +1,30 @@
+{
+  "_comment": "Solo estructura y defaults NO-secretos. Secrets van en .env",
+  "env": "demo",
+  "log_level": "INFO",
+  "kalshi": {
+    "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+    "ws_url": "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  },
+  "binance": {
+    "ws_url": "wss://stream.binance.com:9443/ws",
+    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+  },
+  "hyperliquid": {
+    "base_url": "https://api.hyperliquid.xyz",
+    "symbols": ["BTC", "ETH", "SOL"]
+  },
+  "engine": {
+    "min_ev_threshold": 0.04,
+    "min_delta": 0.05,
+    "min_time_remaining_s": 90,
+    "min_volume_24h": 100,
+    "kelly_fraction": 0.25,
+    "max_position_pct": 0.05
+  },
+  "database": {
+    "path": "./data/trading.db",
+    "wal_mode": true,
+    "busy_timeout_ms": 5000
+  }
+}

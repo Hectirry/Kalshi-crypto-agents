@@ -1,0 +1,2 @@
+"""Entrypoints auxiliares del proyecto."""
+
