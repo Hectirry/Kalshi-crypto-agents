@@ -201,10 +201,14 @@ def _build_router(cfg: AppConfig, db: Database) -> SignalRouter:
 
 # ── Dashboard en background ────────────────────────────────────────────────────
 
-async def _serve_dashboard(db: Database, port: int = DASHBOARD_PORT) -> None:
+async def _serve_dashboard(
+    db: Database,
+    cfg: AppConfig,
+    port: int = DASHBOARD_PORT,
+) -> None:
     """Arranca el servidor FastAPI en background como tarea asyncio."""
     from dashboard.api_server import create_app
-    app = create_app(db=db)
+    app = create_app(db=db, config=cfg)
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
@@ -300,7 +304,7 @@ async def _run_orchestrator(
                 name="recal",
             ),
             asyncio.create_task(
-                _serve_dashboard(db, port=DASHBOARD_PORT),
+                _serve_dashboard(db, cfg=cfg, port=DASHBOARD_PORT),
                 name="dashboard",
             ),
         ]

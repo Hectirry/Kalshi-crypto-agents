@@ -210,13 +210,16 @@ CREATE INDEX idx_trades_status ON trades(status);
 
 ---
 
-## Variables de entorno requeridas
+## Variables de entorno (.env)
 
 ```bash
 # .env (NUNCA commitear este archivo)
 ENV=demo                          # demo | production
+PAPER_TRADE=true                  # descomentar para paper trading con API real
 KALSHI_API_KEY=your_key
 KALSHI_API_SECRET=your_secret
+KALSHI_API_KEY_ID=your_key_id    # para RSA-PSS
+KALSHI_PRIVATE_KEY_PATH=/root/Kalshi-crypto-agents/KalshiApiSecret.pem
 BINANCE_API_KEY=your_key          # opcional en demo
 HYPERLIQUID_API_KEY=your_key      # opcional en demo
 OPENROUTER_API_KEY=your_key       # para el agente LLM
@@ -266,12 +269,24 @@ MIN_EV_THRESHOLD se calibra por VectorBT — valor inicial: 0.04 (4% EV neto)
 cd /root/Kalshi-crypto-agents
 source .venv/bin/activate
 set -a && source .env && set +a
-python main.py --dry-run           # demo, sin credenciales reales
-python main.py                     # usa ENV del .env
-python main.py --backtest-only     # solo recalibra y sale
+
+# Demo (sin API real): paper trading en modo dry-run
+python main.py --dry-run
+
+# Paper trading real (API Kalshi de producción, órdenes simuladas)
+python main.py --paper-trade
+
+# Trading real (requiere API keys con permisos de trading en .env)
+python main.py
+
+# Solo recalibrar parámetros y salir
+python main.py --backtest-only
 ```
 
-Dashboard disponible en `http://localhost:8090/health` mientras el bot corre.
+**Dashboard:**
+- API health: `http://localhost:8090/health`
+- Estado del sistema: `http://localhost:8090/state`
+- Dashboard HTML: `http://localhost:8091/kalshi_scanner_dashboard.html` (si está servido)
 
 ---
 
@@ -326,20 +341,26 @@ kalshi_scanner_dashboard.html → mantener, conectar a dashboard/api_server.py
 
 ---
 
-## Comando de inicio rápido para cada sesión
+## Comandos de operación
 
 ```bash
-# Verificar que el servicio base sigue corriendo
-systemctl status kalshi-bot.service
+# Ver qué está corriendo en puertos
+ss -tlnp | grep -E "8090|8091"
 
-# Correr tests de la fase actual
-cd /root/kalshi_trading && pytest tests/ -v --tb=short
+# Matar procesos del bot
+pkill -f "python main.py"
 
-# Ver logs en tiempo real
+# Matar proceso que ocupa puerto 8090
+kill -9 $(fuser 8090/tcp 2>/dev/null)
+
+# Correr tests
+cd /root/Kalshi-crypto-agents && pytest tests/ -v --tb=short
+
+# Ver logs en tiempo real (si hay servicio systemd)
 journalctl -u kalshi-bot.service -f
 
-# Dashboard
-curl http://localhost:8010/status
+# Ver estado del bot por API
+curl http://localhost:8090/state | python3 -m json.tool
 ```
 
 ---

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kalshi Crypto Live</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img
+          src="https://images.unsplash.com/photo-1642790551116-18e150f248e6?auto=format&fit=crop&w=320&q=80"
+          alt=""
+          class="brand-image"
+        >
+        <div>
+          <p class="eyebrow">Kalshi crypto agents</p>
+          <h1>Mercados en vivo</h1>
+        </div>
+      </div>
+      <div class="status-line">
+        <span class="pulse" aria-hidden="true"></span>
+        <span id="connection-status">Conectando</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="metrics-grid" aria-label="Resumen operativo">
+        <article class="metric">
+          <span>Mercados</span>
+          <strong id="market-count">0</strong>
+        </article>
+        <article class="metric">
+          <span>Posiciones abiertas</span>
+          <strong id="open-count">0</strong>
+        </article>
+        <article class="metric">
+          <span>Bloqueos</span>
+          <strong id="blocked-count">0</strong>
+        </article>
+        <article class="metric">
+          <span>Ultima lectura</span>
+          <strong id="last-refresh">--:--:--</strong>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel primary-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Orderbook Kalshi</p>
+              <h2>Contratos activos</h2>
+            </div>
+            <button id="refresh-now" type="button">Actualizar</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Activo</th>
+                  <th>Strike</th>
+                  <th>YES ask</th>
+                  <th>NO ask</th>
+                  <th>Vol 24h</th>
+                  <th>Expira</th>
+                </tr>
+              </thead>
+              <tbody id="markets-body">
+                <tr>
+                  <td colspan="7" class="empty">Esperando datos de Kalshi</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <aside class="side-stack">
+          <section class="panel">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">Engine</p>
+                <h2>Ultimas senales</h2>
+              </div>
+            </div>
+            <div id="signals-list" class="list-block">
+              <p class="empty">Sin senales todavia</p>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">Riesgo</p>
+                <h2>Posiciones</h2>
+              </div>
+            </div>
+            <div id="trades-list" class="list-block">
+              <p class="empty">Sin posiciones abiertas</p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

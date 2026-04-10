@@ -116,6 +116,8 @@ class KalshiFeed:
 
         Hace una request por cada serie crypto conocida para no depender de la
         paginación genérica que puede no retornar BTC/ETH en los primeros 200.
+        Si el feed no fue conectado por WS, abre una sesión HTTP temporal para
+        permitir uso standalone desde dashboards y smoke checks.
 
         Returns:
             Lista vacía si no hay mercados disponibles o si la request falla.
@@ -130,31 +132,44 @@ class KalshiFeed:
         url = f"{self._config.kalshi.base_url}/markets"
         api_path = urlparse(url).path
 
-        markets: list[MarketSnapshot] = []
-        for series_ticker in series:
-            params = {"status": "open", "limit": 200, "series_ticker": series_ticker}
-            try:
-                async def _do_request(p=params) -> object:
-                    headers = self._auth_headers(method="GET", path=api_path)
-                    async with self._session.get(url, params=p, headers=headers) as resp:
-                        resp.raise_for_status()
-                        return await resp.json()
+        created_session = False
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+            created_session = True
 
-                data = await asyncio.wait_for(_do_request(), timeout=10.0)
-            except Exception as exc:
-                logger.warning("Kalshi get_active_markets falló serie=%s: %s", series_ticker, exc)
-                continue
+        try:
+            markets: list[MarketSnapshot] = []
+            for series_ticker in series:
+                params = {"status": "open", "limit": 200, "series_ticker": series_ticker}
+                try:
+                    async def _do_request(p: dict[str, object] = params) -> object:
+                        headers = self._auth_headers(method="GET", path=api_path)
+                        async with self._session.get(url, params=p, headers=headers) as resp:
+                            resp.raise_for_status()
+                            return await resp.json()
 
-            for raw in data.get("markets", []):
-                snapshot = self._parse_market(raw)
-                if snapshot is not None:
-                    # Cachear strike para que el WS pueda usarlo
-                    if snapshot.strike is not None:
-                        self._strike_cache[snapshot.ticker] = snapshot.strike
-                    if self._passes_filter(snapshot):
-                        markets.append(snapshot)
+                    data = await asyncio.wait_for(_do_request(), timeout=10.0)
+                except Exception as exc:
+                    logger.warning(
+                        "Kalshi get_active_markets falló serie=%s: %s",
+                        series_ticker,
+                        exc,
+                    )
+                    continue
 
-        return markets
+                for raw in data.get("markets", []):
+                    snapshot = self._parse_market(raw)
+                    if snapshot is not None:
+                        # Cachear strike para que el WS pueda usarlo
+                        if snapshot.strike is not None:
+                            self._strike_cache[snapshot.ticker] = snapshot.strike
+                        if self._passes_filter(snapshot):
+                            markets.append(snapshot)
+
+            return markets
+        finally:
+            if created_session:
+                await self._close_session()
 
     async def stream_markets(self) -> AsyncIterator[MarketSnapshot]:
         """

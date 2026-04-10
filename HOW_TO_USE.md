@@ -205,7 +205,9 @@ uvicorn dashboard.api_server:create_app --factory --host 0.0.0.0 --port 8090
 Endpoints disponibles:
 
 - `GET /health`
+- `GET /`
 - `GET /state?limit=20`
+- `GET /live-markets?limit=40`
 
 ## 10. Nota sobre APIs
 
