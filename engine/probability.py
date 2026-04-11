@@ -18,6 +18,43 @@ MAX_PROBABILITY = 0.99
 MOMENTUM_DRIFT_SCALE = 0.35
 
 
+@dataclass(frozen=True, slots=True)
+class VolatilityEstimate:
+    """Estimaciones de volatilidad para tres ventanas temporales distintas.
+
+    Permite que ``ProbabilityEngine.estimate()`` use una mezcla ponderada
+    de ventanas (1 m, 5 m, 15 m) en lugar de confiar en una sola ventana
+    corta que puede sobre/subestimar la varianza real.
+    """
+
+    vol_1m: float | None = None
+    vol_5m: float | None = None
+    vol_15m: float | None = None
+
+    def blended(self) -> float:
+        """Mezcla ponderada de las ventanas disponibles con pesos 40/35/25.
+
+        Si ninguna ventana tiene datos válidos, retorna ``DEFAULT_VOLATILITY_1M``.
+        Si solo hay una ventana disponible, la retorna sin ponderar.
+        Los pesos se renormalizan cuando alguna ventana es ``None``.
+        """
+        available = [
+            (w, v)
+            for w, v in (
+                (0.40, self.vol_1m),
+                (0.35, self.vol_5m),
+                (0.25, self.vol_15m),
+            )
+            if v is not None and v > 0.0
+        ]
+        if not available:
+            return DEFAULT_VOLATILITY_1M
+        if len(available) == 1:
+            return available[0][1]
+        total_weight = sum(w for w, _ in available)
+        return sum(w * v for w, v in available) / total_weight
+
+
 class TimeZone:
     """
     Clasificación del mercado por tiempo restante hasta expiración.
@@ -82,7 +119,8 @@ class ProbabilityEngine:
         self,
         market: MarketSnapshot,
         price: PriceSnapshot,
-        volatility_1m: float | None,
+        volatility_1m: float | None = None,
+        volatility_estimate: VolatilityEstimate | None = None,
     ) -> ProbabilityResult:
         """
         Estima la probabilidad de que el contrato expire in-the-money.
@@ -90,7 +128,9 @@ class ProbabilityEngine:
         Args:
             market: snapshot de Kalshi con strike y tiempo restante.
             price: snapshot de precio spot del subyacente.
-            volatility_1m: volatilidad observada del último minuto.
+            volatility_1m: volatilidad observada del último minuto (path legado).
+            volatility_estimate: estimación multi-ventana; tiene precedencia
+                sobre ``volatility_1m`` cuando se proporciona.
 
         Returns:
             ProbabilityResult con probabilidad estimada y confianza.
@@ -125,11 +165,12 @@ class ProbabilityEngine:
                 error_msg="invalid_price",
             )
 
-        raw_volatility = (
-            volatility_1m
-            if volatility_1m is not None and volatility_1m > 0.0
-            else DEFAULT_VOLATILITY_1M
-        )
+        if volatility_estimate is not None:
+            raw_volatility = volatility_estimate.blended()
+        elif volatility_1m is not None and volatility_1m > 0.0:
+            raw_volatility = volatility_1m
+        else:
+            raw_volatility = DEFAULT_VOLATILITY_1M
         time_scale = math.sqrt(market.time_to_expiry_s / 60.0)
         vol_adjusted = raw_volatility * time_scale
 

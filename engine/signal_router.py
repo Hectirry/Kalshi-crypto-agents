@@ -19,7 +19,7 @@ from core.database import Database
 from core.models import Confidence, Decision, MarketSnapshot, PriceSnapshot, Signal
 from engine.context_builder import LiveSignalFeatures, build_agent_context
 from engine.ev_calculator import EVCalculator
-from engine.probability import ProbabilityEngine, ProbabilityResult
+from engine.probability import ProbabilityEngine, ProbabilityResult, VolatilityEstimate
 from engine.setup_quality import evaluate_setup_quality
 from engine.timing import TimingFilter
 
@@ -87,7 +87,7 @@ class SignalRouter:
         self.openrouter_agent = openrouter_agent
         self.social_sentiment_service = social_sentiment_service
         self._price_memory: dict[str, deque[tuple[float, float]]] = {}
-        self._price_memory_maxlen = 240
+        self._price_memory_maxlen = 960
 
     def evaluate(
         self,
@@ -125,11 +125,11 @@ class SignalRouter:
                     market_probability=market.implied_prob,
                 )
 
-            volatility_1m = self._estimate_volatility_1m(price)
+            vol_estimate = self._estimate_volatility_multi(price)
             probability = self.prob_engine.estimate(
                 market=market,
                 price=price,
-                volatility_1m=volatility_1m,
+                volatility_estimate=vol_estimate,
             )
             if probability.error:
                 self._log_error(market.ticker, probability.error_msg or "probability_error")
@@ -521,6 +521,44 @@ class SignalRouter:
 
         return self._volatility_from_series(series)
 
+    def _estimate_volatility_multi(self, price: PriceSnapshot) -> VolatilityEstimate:
+        """
+        Actualiza la memoria de precios y retorna estimaciones para 1m, 5m y 15m.
+
+        La memoria acumula hasta 960 ticks (suficiente para 15 minutos a ~1 tick/s).
+        Cada ventana usa todos los ticks dentro de ese rango temporal, sin
+        modificar la deque principal.
+        """
+        series = self._price_memory.setdefault(price.symbol, deque(maxlen=self._price_memory_maxlen))
+        series.append((price.timestamp, price.price))
+
+        return VolatilityEstimate(
+            vol_1m=self._vol_for_window_from_memory(price.symbol, 60),
+            vol_5m=self._vol_for_window_from_memory(price.symbol, 300),
+            vol_15m=self._vol_for_window_from_memory(price.symbol, 900),
+        )
+
+    def _vol_for_window_from_memory(self, symbol: str, window_s: int) -> float | None:
+        """
+        Calcula volatilidad logarítmica sobre los últimos ``window_s`` segundos.
+
+        No modifica la deque; solo filtra por timestamp.
+
+        Args:
+            symbol: ticker del subyacente.
+            window_s: ancho de la ventana en segundos.
+
+        Returns:
+            Volatilidad estimada, o ``None`` si la muestra es insuficiente.
+        """
+        series = self._price_memory.get(symbol)
+        if not series:
+            return None
+        now_ts = series[-1][0]
+        cutoff = now_ts - window_s
+        window_ticks = deque((ts, p) for ts, p in series if ts >= cutoff)
+        return self._volatility_from_series(window_ticks)
+
     @staticmethod
     def _volatility_from_series(series: deque[tuple[float, float]]) -> float | None:
         """Calcula volatilidad logarítmica usando una serie ya preparada."""
@@ -566,7 +604,12 @@ class SignalRouter:
             if signal.decision == Decision.YES
             else max(market.no_ask, 1.0 - market.implied_prob)
         )
-        volatility_1m = self._volatility_from_memory(price.symbol) or 0.0
+        vol_estimate = VolatilityEstimate(
+            vol_1m=self._vol_for_window_from_memory(price.symbol, 60),
+            vol_5m=self._vol_for_window_from_memory(price.symbol, 300),
+            vol_15m=self._vol_for_window_from_memory(price.symbol, 900),
+        )
+        volatility_1m = vol_estimate.blended()
         strike = market.strike
         distance_to_strike_pct = 0.0
         strike_distance_sigmas = 0.0

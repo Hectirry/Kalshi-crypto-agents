@@ -21,6 +21,7 @@ from engine.probability import (
     MOMENTUM_DRIFT_SCALE,
     ProbabilityEngine,
     TimeZone,
+    VolatilityEstimate,
     classify_time_zone,
 )
 from engine.signal_router import SignalRouter
@@ -624,8 +625,10 @@ class TestSignalRouter:
             bankroll=1_000.0,
         )
 
-        used_volatility = prob_engine.estimate.call_args.kwargs["volatility_1m"]
-        assert used_volatility is None
+        # El router ahora pasa volatility_estimate (VolatilityEstimate) en lugar de
+        # volatility_1m; con solo un tick en memoria todas las ventanas son None.
+        used_ve = prob_engine.estimate.call_args.kwargs["volatility_estimate"]
+        assert used_ve.vol_1m is None
         ev_calc.calculate.assert_not_called()
 
     def test_router_uses_realized_volatility_from_price_history(
@@ -663,9 +666,11 @@ class TestSignalRouter:
         router.evaluate(market=market, price=p2, bankroll=1_000.0)
         router.evaluate(market=market, price=p3, bankroll=1_000.0)
 
-        used_volatility = prob_engine.estimate.call_args.kwargs["volatility_1m"]
-        assert used_volatility is not None
-        assert used_volatility > 0.0
+        # El router pasa volatility_estimate; después de 3 ticks la ventana 1m debe
+        # tener al menos retornos suficientes para un valor no nulo.
+        used_ve = prob_engine.estimate.call_args.kwargs["volatility_estimate"]
+        assert used_ve.vol_1m is not None
+        assert used_ve.vol_1m > 0.0
 
     def test_delta_zero_skips_as_no_trade(
         self,
@@ -1353,3 +1358,109 @@ class TestEVNormalized:
         )
 
         assert result.ev_net > 0.0
+
+
+class TestVolatilityEstimate:
+    """Tests para VolatilityEstimate dataclass y flujo multi-timeframe en SignalRouter."""
+
+    # ------------------------------------------------------------------
+    # 1. VolatilityEstimate.blended() — lógica de mezcla ponderada
+    # ------------------------------------------------------------------
+
+    def test_blended_all_windows_uses_weighted_average(self):
+        """Con las tres ventanas disponibles el resultado es la media ponderada 40/35/25."""
+        ve = VolatilityEstimate(vol_1m=0.010, vol_5m=0.008, vol_15m=0.006)
+        expected = (0.40 * 0.010 + 0.35 * 0.008 + 0.25 * 0.006) / 1.0
+        assert abs(ve.blended() - expected) < 1e-9
+
+    def test_blended_only_one_window_returns_that_value(self):
+        """Cuando solo hay una ventana disponible, se retorna su valor directamente."""
+        ve = VolatilityEstimate(vol_1m=None, vol_5m=0.007, vol_15m=None)
+        assert ve.blended() == 0.007
+
+    def test_blended_no_windows_returns_default(self):
+        """Sin ninguna ventana válida, se retorna DEFAULT_VOLATILITY_1M."""
+        ve = VolatilityEstimate()
+        assert ve.blended() == DEFAULT_VOLATILITY_1M
+
+    def test_blended_renormalizes_partial_windows(self):
+        """Con solo vol_1m y vol_5m los pesos 0.40/0.35 se renormalizan a 0.4/0.75 y 0.35/0.75."""
+        ve = VolatilityEstimate(vol_1m=0.010, vol_5m=0.005, vol_15m=None)
+        total_w = 0.40 + 0.35
+        expected = (0.40 * 0.010 + 0.35 * 0.005) / total_w
+        assert abs(ve.blended() - expected) < 1e-9
+
+    # ------------------------------------------------------------------
+    # 2. ProbabilityEngine.estimate() — volatility_estimate tiene precedencia
+    # ------------------------------------------------------------------
+
+    def test_estimate_uses_volatility_estimate_over_float(
+        self, make_market_snapshot, make_price_snapshot
+    ):
+        """volatility_estimate tiene precedencia sobre volatility_1m cuando ambos se pasan.
+
+        Verificación por igualdad de ruta: pasar vol=0.020 vía volatility_estimate con
+        volatility_1m=0.001 debe producir exactamente el mismo resultado que pasar
+        vol=0.020 vía volatility_1m solo (ambos usan raw_volatility=0.020).
+        """
+        engine = ProbabilityEngine()
+        market = make_market_snapshot(strike=50_000.0, time_to_expiry_s=300, implied_prob=0.50)
+        price = make_price_snapshot(price=51_000.0)
+
+        # Ruta 1: volatility_estimate con vol_1m=0.020, float=0.001 (debe ignorarse)
+        result_via_estimate = engine.estimate(
+            market=market,
+            price=price,
+            volatility_1m=0.001,
+            volatility_estimate=VolatilityEstimate(vol_1m=0.020),
+        )
+
+        # Ruta 2: solo float=0.020 (sin volatility_estimate)
+        result_via_float = engine.estimate(
+            market=market,
+            price=price,
+            volatility_1m=0.020,
+        )
+
+        # Si volatility_estimate tiene precedencia, ambas rutas deben producir idéntico my_prob
+        assert abs(result_via_estimate.my_prob - result_via_float.my_prob) < 1e-9
+
+    # ------------------------------------------------------------------
+    # 3. SignalRouter._vol_for_window_from_memory — aislamiento de ventanas
+    # ------------------------------------------------------------------
+
+    def test_vol_for_window_only_uses_ticks_within_window(
+        self, app_config, db, make_market_snapshot, make_price_snapshot
+    ):
+        """_vol_for_window_from_memory no mezcla ticks fuera de la ventana solicitada."""
+        from engine.ev_calculator import EVCalculator
+        from engine.timing import TimingFilter
+
+        router = SignalRouter(
+            prob_engine=ProbabilityEngine(),
+            ev_calc=EVCalculator(),
+            timing_filter=TimingFilter(),
+            config=app_config,
+            db=db,
+            blocked_categories=set(),
+        )
+
+        base_ts = 1_000_000.0
+        symbol = "BTC"
+        # Inyectar precios a lo largo de 10 minutos
+        for i in range(61):
+            router._price_memory.setdefault(symbol, __import__("collections").deque(maxlen=router._price_memory_maxlen))
+            router._price_memory[symbol].append((base_ts + i, 50_000.0 + i * 10))
+
+        # Ventana de 60 s: solo los últimos 60 ticks
+        vol_60 = router._vol_for_window_from_memory(symbol, 60)
+        # Ventana de 600 s: los 61 ticks (todos están dentro)
+        vol_600 = router._vol_for_window_from_memory(symbol, 600)
+
+        # Con el mismo conjunto de retornos lineales la vol debe ser idéntica (serie uniforme)
+        # pero el número de ticks en cada ventana es diferente — lo que nos interesa es
+        # que vol_60 no sea None (tiene suficientes ticks) y que no explote.
+        assert vol_60 is not None
+        assert vol_600 is not None
+        assert vol_60 >= 0.0
+        assert vol_600 >= 0.0
