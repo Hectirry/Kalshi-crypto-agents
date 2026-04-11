@@ -50,6 +50,15 @@ class HyperliquidConfig:
 
 
 @dataclass(frozen=True)
+class EngineCategoryOverride:
+    min_ev_threshold: float | None = None
+    min_delta: float | None = None
+    min_time_remaining_s: int | None = None
+    min_contract_price: float | None = None
+    max_contract_price: float | None = None
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     min_ev_threshold:       float   # EV mínimo neto de fees para entrar (default: 0.04)
     min_delta:              float   # Delta mínimo my_prob - market_prob (default: 0.05)
@@ -57,6 +66,14 @@ class EngineConfig:
     min_volume_24h:         int     # Liquidez mínima en contratos (default: 100)
     kelly_fraction:         float   # Fracción del Kelly completo (default: 0.25)
     max_position_pct:       float   # Máximo % del bankroll por trade (default: 0.05)
+    min_contract_price:     float = 0.10  # Evita contratos demasiado baratos/caros
+    max_contract_price:     float = 0.90
+    max_market_overround_bps: float = 150.0
+    setup_quality_gate_enabled: bool = False
+    setup_quality_min_samples: int = 3
+    setup_quality_min_win_rate: float = 0.40
+    setup_quality_history_limit: int = 500
+    category_overrides:     dict[str, EngineCategoryOverride] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,21 @@ class DatabaseConfig:
     path:            Path
     wal_mode:        bool = True     # WAL para escrituras concurrentes
     busy_timeout_ms: int  = 5000
+
+
+@dataclass(frozen=True)
+class SocialSentimentConfig:
+    enabled: bool = False
+    provider: str = "reddit"
+    refresh_interval_s: int = 300
+    ttl_s: int = 900
+    request_timeout_s: float = 5.0
+    cache_path: Path = Path("./data/social_sentiment_cache.json")
+    supported_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    reddit_subreddits: list[str] = field(
+        default_factory=lambda: ["CryptoCurrency", "Bitcoin", "ethtrader", "solana"]
+    )
+    max_posts_per_asset: int = 25
 
 
 @dataclass(frozen=True)
@@ -75,6 +107,7 @@ class AppConfig:
     hyperliquid: HyperliquidConfig
     engine:      EngineConfig
     database:    DatabaseConfig
+    social_sentiment: SocialSentimentConfig
 
     @property
     def is_demo(self) -> bool:
@@ -98,7 +131,6 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
         config_file: ruta al config.json. Si es None, busca en:
                      1. $CONFIG_PATH
                      2. ./config.json
-                     3. /root/Kalshi Trading/config.json
 
     Returns:
         AppConfig validado y listo para usar.
@@ -187,6 +219,18 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
 
     # ── Engine ────────────────────────────────────────────────────────────────
     eng_cfg = raw.get("engine", {})
+    raw_overrides = eng_cfg.get("category_overrides", {})
+    category_overrides: dict[str, EngineCategoryOverride] = {}
+    for category, override in raw_overrides.items():
+        if not isinstance(override, dict):
+            raise ValueError(f"engine.category_overrides.{category} debe ser un objeto")
+        category_overrides[str(category).upper()] = EngineCategoryOverride(
+            min_ev_threshold=float(override["min_ev_threshold"]) if "min_ev_threshold" in override else None,
+            min_delta=float(override["min_delta"]) if "min_delta" in override else None,
+            min_time_remaining_s=int(override["min_time_remaining_s"]) if "min_time_remaining_s" in override else None,
+            min_contract_price=float(override["min_contract_price"]) if "min_contract_price" in override else None,
+            max_contract_price=float(override["max_contract_price"]) if "max_contract_price" in override else None,
+        )
     engine = EngineConfig(
         min_ev_threshold     = float(eng_cfg.get("min_ev_threshold", 0.04)),
         min_delta            = float(eng_cfg.get("min_delta", 0.05)),
@@ -194,6 +238,14 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
         min_volume_24h       = int(eng_cfg.get("min_volume_24h", 100)),
         kelly_fraction       = float(eng_cfg.get("kelly_fraction", 0.25)),
         max_position_pct     = float(eng_cfg.get("max_position_pct", 0.05)),
+        min_contract_price   = float(eng_cfg.get("min_contract_price", 0.10)),
+        max_contract_price   = float(eng_cfg.get("max_contract_price", 0.90)),
+        max_market_overround_bps = float(eng_cfg.get("max_market_overround_bps", 150.0)),
+        setup_quality_gate_enabled = bool(eng_cfg.get("setup_quality_gate_enabled", False)),
+        setup_quality_min_samples = int(eng_cfg.get("setup_quality_min_samples", 3)),
+        setup_quality_min_win_rate = float(eng_cfg.get("setup_quality_min_win_rate", 0.40)),
+        setup_quality_history_limit = int(eng_cfg.get("setup_quality_history_limit", 500)),
+        category_overrides   = category_overrides,
     )
 
     _validate_engine_config(engine)
@@ -212,6 +264,59 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
         busy_timeout_ms = int(raw.get("database", {}).get("busy_timeout_ms", 5000)),
     )
 
+    social_raw = raw.get("social_sentiment", {})
+    social_enabled = _env_bool(
+        "SOCIAL_SENTIMENT_ENABLED",
+        bool(social_raw.get("enabled", False)),
+    )
+    cache_path = Path(
+        os.getenv(
+            "SOCIAL_SENTIMENT_CACHE_PATH",
+            str(social_raw.get("cache_path", "./data/social_sentiment_cache.json")),
+        )
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    social_sentiment = SocialSentimentConfig(
+        enabled=social_enabled,
+        provider=os.getenv(
+            "SOCIAL_SENTIMENT_PROVIDER",
+            str(social_raw.get("provider", "reddit")),
+        ).strip().lower(),
+        refresh_interval_s=int(
+            os.getenv(
+                "SOCIAL_SENTIMENT_REFRESH_INTERVAL_S",
+                social_raw.get("refresh_interval_s", 300),
+            )
+        ),
+        ttl_s=int(os.getenv("SOCIAL_SENTIMENT_TTL_S", social_raw.get("ttl_s", 900))),
+        request_timeout_s=float(
+            os.getenv(
+                "SOCIAL_SENTIMENT_REQUEST_TIMEOUT_S",
+                social_raw.get("request_timeout_s", 5.0),
+            )
+        ),
+        cache_path=cache_path,
+        supported_assets=_env_csv(
+            "SOCIAL_SENTIMENT_ASSETS",
+            social_raw.get("supported_assets", ["BTC", "ETH", "SOL"]),
+        ),
+        reddit_subreddits=_env_csv(
+            "SOCIAL_SENTIMENT_REDDIT_SUBREDDITS",
+            social_raw.get(
+                "reddit_subreddits",
+                ["CryptoCurrency", "Bitcoin", "ethtrader", "solana"],
+            ),
+        ),
+        max_posts_per_asset=int(
+            os.getenv(
+                "SOCIAL_SENTIMENT_MAX_POSTS_PER_ASSET",
+                social_raw.get("max_posts_per_asset", 25),
+            )
+        ),
+    )
+
+    _validate_social_sentiment_config(social_sentiment)
+
     log_level = os.getenv("LOG_LEVEL", raw.get("log_level", "INFO")).upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         raise ValueError(f"LOG_LEVEL inválido: {log_level}")
@@ -224,6 +329,7 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
         hyperliquid = hyperliquid,
         engine      = engine,
         database    = database,
+        social_sentiment = social_sentiment,
     )
 
     logger.info(
@@ -263,7 +369,6 @@ def _load_json(config_file: str | Path | None) -> dict:
             candidates.append(Path(env_path))
         candidates.extend([
             Path("config.json"),
-            Path("/root/Kalshi Trading/config.json"),
         ])
 
     for path in candidates:
@@ -296,6 +401,117 @@ def _validate_engine_config(cfg: EngineConfig) -> None:
         errors.append(f"kelly_fraction debe estar en (0, 1]: {cfg.kelly_fraction}")
     if not (0.0 < cfg.max_position_pct <= 0.25):
         errors.append(f"max_position_pct demasiado alto (máx 25%): {cfg.max_position_pct}")
+    if not (0.0 < cfg.min_contract_price < 1.0):
+        errors.append(
+            f"min_contract_price debe estar en (0, 1): {cfg.min_contract_price}"
+        )
+    if not (0.0 < cfg.max_contract_price < 1.0):
+        errors.append(
+            f"max_contract_price debe estar en (0, 1): {cfg.max_contract_price}"
+        )
+    if cfg.max_market_overround_bps < 0.0:
+        errors.append(
+            "max_market_overround_bps no puede ser negativo: "
+            f"{cfg.max_market_overround_bps}"
+        )
+    if cfg.setup_quality_min_samples < 1:
+        errors.append(
+            "setup_quality_min_samples debe ser >= 1: "
+            f"{cfg.setup_quality_min_samples}"
+        )
+    if not (0.0 <= cfg.setup_quality_min_win_rate <= 1.0):
+        errors.append(
+            "setup_quality_min_win_rate debe estar en [0, 1]: "
+            f"{cfg.setup_quality_min_win_rate}"
+        )
+    if cfg.setup_quality_history_limit < 50:
+        errors.append(
+            "setup_quality_history_limit muy bajo (mín 50): "
+            f"{cfg.setup_quality_history_limit}"
+        )
+    if cfg.min_contract_price >= cfg.max_contract_price:
+        errors.append(
+            "min_contract_price debe ser menor que max_contract_price: "
+            f"{cfg.min_contract_price} >= {cfg.max_contract_price}"
+        )
+    for category, override in cfg.category_overrides.items():
+        if override.min_ev_threshold is not None and not (0.0 < override.min_ev_threshold < 1.0):
+            errors.append(
+                f"category_overrides.{category}.min_ev_threshold inválido: {override.min_ev_threshold}"
+            )
+        if override.min_delta is not None and not (0.0 < override.min_delta < 1.0):
+            errors.append(f"category_overrides.{category}.min_delta inválido: {override.min_delta}")
+        if override.min_time_remaining_s is not None and override.min_time_remaining_s < 30:
+            errors.append(
+                f"category_overrides.{category}.min_time_remaining_s muy bajo: "
+                f"{override.min_time_remaining_s}"
+            )
+        if override.min_contract_price is not None and not (0.0 < override.min_contract_price < 1.0):
+            errors.append(
+                f"category_overrides.{category}.min_contract_price inválido: "
+                f"{override.min_contract_price}"
+            )
+        if override.max_contract_price is not None and not (0.0 < override.max_contract_price < 1.0):
+            errors.append(
+                f"category_overrides.{category}.max_contract_price inválido: "
+                f"{override.max_contract_price}"
+            )
+        min_price = override.min_contract_price if override.min_contract_price is not None else cfg.min_contract_price
+        max_price = override.max_contract_price if override.max_contract_price is not None else cfg.max_contract_price
+        if min_price >= max_price:
+            errors.append(
+                f"category_overrides.{category} rango de precio inválido: {min_price} >= {max_price}"
+            )
 
     if errors:
         raise ValueError("Configuración de engine inválida:\n" + "\n".join(f"  - {e}" for e in errors))
+
+
+def _validate_social_sentiment_config(cfg: SocialSentimentConfig) -> None:
+    """Valida la configuración de sentimiento social opcional."""
+    errors: list[str] = []
+
+    if cfg.provider not in {"reddit", "dummy"}:
+        errors.append(f"social_sentiment.provider inválido: {cfg.provider}")
+    if cfg.refresh_interval_s <= 0:
+        errors.append(
+            f"social_sentiment.refresh_interval_s debe ser > 0: {cfg.refresh_interval_s}"
+        )
+    if cfg.ttl_s <= 0:
+        errors.append(f"social_sentiment.ttl_s debe ser > 0: {cfg.ttl_s}")
+    if cfg.request_timeout_s <= 0:
+        errors.append(
+            "social_sentiment.request_timeout_s debe ser > 0: "
+            f"{cfg.request_timeout_s}"
+        )
+    if cfg.max_posts_per_asset <= 0:
+        errors.append(
+            "social_sentiment.max_posts_per_asset debe ser > 0: "
+            f"{cfg.max_posts_per_asset}"
+        )
+    if not cfg.supported_assets:
+        errors.append("social_sentiment.supported_assets no puede estar vacío")
+    if cfg.refresh_interval_s > cfg.ttl_s:
+        errors.append(
+            "social_sentiment.refresh_interval_s no puede exceder ttl_s: "
+            f"{cfg.refresh_interval_s} > {cfg.ttl_s}"
+        )
+
+    if errors:
+        raise ValueError("Configuración de social sentiment inválida:\n" + "\n".join(f"  - {e}" for e in errors))
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """Parsea un bool desde env con fallback."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv(key: str, default: list[str]) -> list[str]:
+    """Parsea una lista CSV desde env con fallback."""
+    raw = os.getenv(key)
+    if raw is None:
+        return [str(item).upper() for item in default]
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]

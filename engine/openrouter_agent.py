@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from core.models import MarketSnapshot, PriceSnapshot, Signal
+from engine.context_builder import AgentContext
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class OpenRouterAgent:
         signal: Signal,
         market: MarketSnapshot,
         price: PriceSnapshot,
-        recent_signals: list[Signal],
+        context: AgentContext,
     ) -> AgentVerdict:
         """
         Consulta al agente LLM para segunda opinión sobre una señal MEDIUM.
@@ -76,7 +77,7 @@ class OpenRouterAgent:
             signal: señal del engine a validar.
             market: snapshot del mercado en el momento de la señal.
             price: snapshot del precio spot.
-            recent_signals: últimas señales del mismo ticker (máx 5).
+            context: contexto histórico construido desde señales resueltas.
 
         Returns:
             AgentVerdict con la decisión del agente.
@@ -87,7 +88,7 @@ class OpenRouterAgent:
                     signal=signal,
                     market=market,
                     price=price,
-                    recent_signals=recent_signals,
+                    context=context,
                 ),
                 timeout=AGENT_TIMEOUT_S,
             )
@@ -121,49 +122,149 @@ class OpenRouterAgent:
         signal: Signal,
         market: MarketSnapshot,
         price: PriceSnapshot,
-        recent_signals: list[Signal],
-    ) -> str:
-        """Construye el prompt de consulta al modelo en español."""
-        ganadas = sum(
-            1 for s in recent_signals if s.outcome and s.outcome.value == "WIN"
-        )
-        perdidas = sum(
-            1 for s in recent_signals if s.outcome and s.outcome.value == "LOSS"
-        )
+        context: AgentContext,
+    ) -> list[dict[str, str]]:
+        """Construye mensajes compactos y estructurados para el modelo."""
         strike = market.strike or "N/A"
+        ticker_examples = ", ".join(
+            (
+                f"{entry.outcome}/{entry.decision}/delta={entry.delta:.3f}/ev={entry.ev_net_fees:.3f}"
+                for entry in context.recent_same_ticker
+            )
+        ) or "sin historial resuelto"
+        category_examples = ", ".join(
+            (
+                f"{entry.ticker}:{entry.outcome}/{entry.decision}/delta={entry.delta:.3f}"
+                for entry in context.recent_same_category
+            )
+        ) or "sin historial resuelto"
+        setup_examples = ", ".join(
+            (
+                f"{entry.outcome}/{entry.decision}/delta={entry.delta:.3f}/ev={entry.ev_net_fees:.3f}"
+                for entry in context.recent_same_setup
+            )
+        ) or "sin analogos cercanos"
 
-        return (
-            "Contexto: mercado Kalshi de 15 minutos.\n"
-            f"Activo: {market.ticker} | Strike: {strike} | Precio spot: {price.price:.2f}\n"
-            f"Tiempo restante: {market.time_to_expiry_s}s\n"
-            f"Delta calculado: {signal.delta:.3f} | EV neto: {signal.ev_net_fees:.3f}\n"
-            f"Historial reciente ({len(recent_signals)} señales): "
-            f"{ganadas} ganadas / {perdidas} perdidas\n"
-            "\n"
-            f"¿Confirmas la entrada con kelly={signal.kelly_size:.2f}?\n"
-            "Responde SOLO con JSON válido:\n"
-            f'{{"proceed": true, "adjusted_kelly": {signal.kelly_size:.2f}, "reasoning": "motivo corto"}}'
+        feature_lines = ["Features vivas: no disponibles"]
+        if context.live_features is not None:
+            features = context.live_features
+            open_interest = (
+                f"{features.open_interest_proxy:.2f}"
+                if features.open_interest_proxy is not None
+                else "n/a"
+            )
+            feature_lines = [
+                "Features vivas:",
+                (
+                    f"- side={features.contract_side} contract_price={features.contract_price:.3f} "
+                    f"market_skew={features.market_skew:.3f}"
+                ),
+                (
+                    f"- distance_to_strike_pct={features.distance_to_strike_pct:.4%} "
+                    f"strike_distance_sigmas={features.strike_distance_sigmas:.2f}"
+                ),
+                (
+                    f"- realized_vol_1m={features.realized_vol_1m:.5f} "
+                    f"mom_15s={features.momentum_15s_pct:.4%} "
+                    f"mom_60s={features.momentum_60s_pct:.4%} "
+                    f"rsi_14={features.rsi_14:.1f}"
+                ),
+                (
+                    f"- spread_bps={features.bid_ask_spread_bps:.2f} "
+                    f"open_interest_proxy={open_interest}"
+                ),
+                (
+                    f"- trend_alignment={features.trend_alignment} "
+                    f"regime_label={features.regime_label}"
+                ),
+            ]
+
+        social_lines = [
+            "Sentimiento social: no disponible o desactivado; ignóralo sin inferir nada."
+        ]
+        if context.social_sentiment is not None:
+            sentiment = context.social_sentiment
+            social_lines = [
+                "Contexto social secundario:",
+                (
+                    f"- source={sentiment.source} sentiment_score={sentiment.sentiment_score:.3f} "
+                    f"mentions={sentiment.mention_count} confidence={sentiment.confidence:.2f}"
+                ),
+                (
+                    f"- bullish_ratio={sentiment.bullish_ratio:.1%} "
+                    f"bearish_ratio={sentiment.bearish_ratio:.1%} "
+                    f"acceleration={sentiment.acceleration:.3f}"
+                ),
+                f"- age_seconds={sentiment.age_seconds}",
+            ]
+
+        system_prompt = (
+            "Eres un revisor cuantitativo de riesgo para mercados crypto de 15 minutos en Kalshi. "
+            "No inventes datos. Usa primero evidencia resuelta comparable y luego features vivas. "
+            "Pesa fuerte: delta, EV neto, distancia al strike en sigmas, volatilidad realizada, "
+            "momentum 15s/60s, alineación de tendencia, spread y análogos históricos del mismo setup. "
+            "Si hay contexto social, úsalo solo como señal secundaria de confirmación o cautela. "
+            "Pesa poco RSI si contradice el resto. No aumentes kelly; solo mantenlo o bájalo. "
+            "Si faltan datos externos o de sentimiento social, ignóralos en vez de alucinar."
         )
+        user_prompt = "\n".join(
+            [
+                "Contexto: mercado Kalshi crypto de 15 minutos.",
+                f"Activo: {market.ticker} | Strike: {strike} | Precio spot: {price.price:.2f}",
+                f"Tiempo restante: {market.time_to_expiry_s}s",
+                (
+                    f"Decision base: {signal.decision.value} | Delta: {signal.delta:.3f} | "
+                    f"EV neto: {signal.ev_net_fees:.3f} | Kelly base: {signal.kelly_size:.3f}"
+                ),
+                "Evalúa solo con evidencia histórica resuelta (WIN/LOSS reales) y KPIs presentes.",
+                (
+                    f"Global resuelto: n={context.overall.sample_size} wr={context.overall.win_rate:.1%} "
+                    f"avg_delta={context.overall.avg_delta:.3f} avg_ev={context.overall.avg_ev_net:.3f}"
+                ),
+                f"Categoría {context.category}: n={context.same_category.sample_size} wr={context.same_category.win_rate:.1%}",
+                f"Misma ventana {context.time_zone}: n={context.same_time_zone.sample_size} wr={context.same_time_zone.win_rate:.1%}",
+                f"Mismo ticker: n={context.same_ticker.sample_size} wr={context.same_ticker.win_rate:.1%}",
+                (
+                    f"Misma dirección {signal.decision.value}: n={context.same_direction.sample_size} "
+                    f"wr={context.same_direction.win_rate:.1%}"
+                ),
+                (
+                    f"Mismo setup (dirección + bucket de delta + ventana): "
+                    f"n={context.same_setup.sample_size} wr={context.same_setup.win_rate:.1%}"
+                ),
+                *feature_lines,
+                *social_lines,
+                f"Últimos resueltos mismo ticker: {ticker_examples}",
+                f"Últimos resueltos misma categoría: {category_examples}",
+                f"Últimos resueltos mismo setup: {setup_examples}",
+                "Responde SOLO con JSON válido:",
+                f'{{"proceed": true, "adjusted_kelly": {signal.kelly_size:.2f}, "reasoning": "motivo corto y concreto"}}',
+            ]
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
     async def _call_api(
         self,
         signal: Signal,
         market: MarketSnapshot,
         price: PriceSnapshot,
-        recent_signals: list[Signal],
+        context: AgentContext,
     ) -> AgentVerdict:
         """Llama al API de OpenRouter y parsea el veredicto."""
-        prompt = self._build_prompt(
+        messages = self._build_prompt(
             signal=signal,
             market=market,
             price=price,
-            recent_signals=recent_signals,
+            context=context,
         )
         payload = {
             "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 100,
+            "max_tokens": 140,
         }
         headers = {
             "Authorization": f"Bearer {self._api_key}",

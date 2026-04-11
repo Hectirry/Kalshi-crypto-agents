@@ -3,106 +3,166 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Kalshi Crypto Live</title>
+    <title>Kalshi Crypto Control Room</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <img
-          src="https://images.unsplash.com/photo-1642790551116-18e150f248e6?auto=format&fit=crop&w=320&q=80"
-          alt=""
-          class="brand-image"
-        >
-        <div>
-          <p class="eyebrow">Kalshi crypto agents</p>
-          <h1>Mercados en vivo</h1>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Kalshi Crypto Agents</p>
+          <h1>Control Room</h1>
+          <p class="hero-text">
+            Vista operativa para entender el flujo del bot, qué mercados están
+            listos, por qué no hay posiciones abiertas y lanzar acciones manuales en paper mode.
+          </p>
         </div>
-      </div>
-      <div class="status-line">
-        <span class="pulse" aria-hidden="true"></span>
-        <span id="connection-status">Conectando</span>
-      </div>
-    </header>
-
-    <main>
-      <section class="metrics-grid" aria-label="Resumen operativo">
-        <article class="metric">
-          <span>Mercados</span>
-          <strong id="market-count">0</strong>
-        </article>
-        <article class="metric">
-          <span>Posiciones abiertas</span>
-          <strong id="open-count">0</strong>
-        </article>
-        <article class="metric">
-          <span>Bloqueos</span>
-          <strong id="blocked-count">0</strong>
-        </article>
-        <article class="metric">
-          <span>Ultima lectura</span>
-          <strong id="last-refresh">--:--:--</strong>
-        </article>
-      </section>
-
-      <section class="content-grid">
-        <div class="panel primary-panel">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Orderbook Kalshi</p>
-              <h2>Contratos activos</h2>
-            </div>
-            <button id="refresh-now" type="button">Actualizar</button>
+        <div class="hero-status">
+          <div class="status-line">
+            <span class="pulse" aria-hidden="true"></span>
+            <span id="connection-status">Conectando</span>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Ticker</th>
-                  <th>Activo</th>
-                  <th>Strike</th>
-                  <th>YES ask</th>
-                  <th>NO ask</th>
-                  <th>Vol 24h</th>
-                  <th>Expira</th>
-                </tr>
-              </thead>
-              <tbody id="markets-body">
-                <tr>
-                  <td colspan="7" class="empty">Esperando datos de Kalshi</td>
-                </tr>
-              </tbody>
-            </table>
+          <div class="hero-meta">
+            <span>Modo efectivo</span>
+            <strong id="effective-mode">--</strong>
           </div>
+          <button id="refresh-now" type="button" class="primary-button">Actualizar</button>
         </div>
+      </header>
 
-        <aside class="side-stack">
-          <section class="panel">
-            <div class="section-heading compact">
+      <main>
+        <section class="metrics-grid" aria-label="Resumen operativo">
+          <article class="metric accent-market">
+            <span>Mercados en vivo</span>
+            <strong id="market-count">0</strong>
+          </article>
+          <article class="metric accent-open">
+            <span>Posiciones abiertas</span>
+            <strong id="open-count">0</strong>
+          </article>
+          <article class="metric accent-total">
+            <span>P&amp;L total</span>
+            <strong id="total-pnl">$0.00</strong>
+          </article>
+          <article class="metric accent-realized">
+            <span>P&amp;L realizado</span>
+            <strong id="realized-pnl">$0.00</strong>
+          </article>
+          <article class="metric">
+            <span>P&amp;L abierto</span>
+            <strong id="open-pnl">$0.00</strong>
+          </article>
+          <article class="metric">
+            <span>Trades cerrados</span>
+            <strong id="closed-count">0</strong>
+          </article>
+          <article class="metric">
+            <span>Categorías bloqueadas</span>
+            <strong id="blocked-count">0</strong>
+          </article>
+          <article class="metric">
+            <span>Última lectura</span>
+            <strong id="last-refresh">--:--:--</strong>
+          </article>
+        </section>
+
+        <section class="top-grid">
+          <section class="panel spotlight-panel">
+            <div class="section-heading">
               <div>
-                <p class="eyebrow">Engine</p>
-                <h2>Ultimas senales</h2>
+                <p class="eyebrow">Flujo</p>
+                <h2>Qué está frenando al bot</h2>
               </div>
             </div>
-            <div id="signals-list" class="list-block">
-              <p class="empty">Sin senales todavia</p>
+            <div class="flow-grid">
+              <article class="flow-card">
+                <span class="flow-label">Decisiones recientes</span>
+                <div id="decision-summary" class="flow-content"></div>
+              </article>
+              <article class="flow-card">
+                <span class="flow-label">Razones de skip / wait</span>
+                <div id="skip-summary" class="flow-content"></div>
+              </article>
+              <article class="flow-card">
+                <span class="flow-label">Bloqueos activos</span>
+                <div id="blocked-list" class="flow-content"></div>
+              </article>
             </div>
           </section>
 
-          <section class="panel">
-            <div class="section-heading compact">
+          <section class="panel control-panel">
+            <div class="section-heading">
               <div>
-                <p class="eyebrow">Riesgo</p>
-                <h2>Posiciones</h2>
+                <p class="eyebrow">Acción manual</p>
+                <h2>Paper Mode</h2>
               </div>
             </div>
-            <div id="trades-list" class="list-block">
-              <p class="empty">Sin posiciones abiertas</p>
+            <div class="control-copy">
+              <p>
+                Desde aquí puedes abrir o cerrar una posición manual en paper mode.
+                El bot la verá al sincronizar la base.
+              </p>
+              <p id="manual-action-hint" class="hint">
+                Selecciona un mercado en la lista para operar rápido.
+              </p>
+              <div id="manual-feedback" class="manual-feedback" aria-live="polite"></div>
             </div>
           </section>
-        </aside>
-      </section>
-    </main>
+        </section>
+
+        <section class="content-grid">
+          <section class="panel market-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Kalshi</p>
+                <h2>Mercados activos claros y accionables</h2>
+              </div>
+            </div>
+            <div id="market-cards" class="market-cards">
+              <p class="empty">Esperando datos de mercado</p>
+            </div>
+          </section>
+
+          <aside class="side-stack">
+            <section class="panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Riesgo</p>
+                  <h2>Posiciones abiertas</h2>
+                </div>
+              </div>
+              <div id="open-trades-list" class="list-block">
+                <p class="empty">Sin posiciones abiertas</p>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Historial</p>
+                  <h2>Trades cerrados</h2>
+                </div>
+              </div>
+              <div id="closed-trades-list" class="list-block">
+                <p class="empty">Sin trades cerrados</p>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Engine</p>
+                  <h2>Últimas señales</h2>
+                </div>
+              </div>
+              <div id="signals-list" class="list-block">
+                <p class="empty">Sin señales todavía</p>
+              </div>
+            </section>
+          </aside>
+        </section>
+      </main>
+    </div>
 
     <script src="/static/app.js" defer></script>
   </body>

@@ -99,6 +99,8 @@ class MarketSnapshot:
         timestamp:       unix timestamp del snapshot
         category:        categoría del activo, ej: "BTC", "ETH"
         strike:          nivel de precio del strike, ej: 95000.0
+        event_ticker:    ticker del evento Kalshi contenedor
+        title:           título humano del mercado según Kalshi
     """
     ticker:           str
     implied_prob:     float
@@ -109,6 +111,8 @@ class MarketSnapshot:
     timestamp:        float
     category:         str = "UNKNOWN"
     strike:           float | None = None
+    event_ticker:     str | None = None
+    title:            str | None = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.implied_prob <= 1.0):
@@ -158,6 +162,8 @@ class Signal:
     time_remaining_s:   int
     reasoning:          str
     timestamp:          float
+    contract_price:     float | None = None
+    market_overround_bps: float | None = None
     error_msg:          str | None = None
     # Se rellena después al conocer el outcome real
     outcome:            Outcome | None = None
@@ -170,6 +176,12 @@ class Signal:
             raise ValueError(f"market_probability fuera de [0,1]: {self.market_probability}")
         if not (0.0 <= self.kelly_size <= 1.0):
             raise ValueError(f"kelly_size fuera de [0,1]: {self.kelly_size}")
+        if self.contract_price is not None and not (0.0 <= self.contract_price <= 1.0):
+            raise ValueError(f"contract_price fuera de [0,1]: {self.contract_price}")
+        if self.market_overround_bps is not None and self.market_overround_bps < 0.0:
+            raise ValueError(
+                f"market_overround_bps no puede ser negativo: {self.market_overround_bps}"
+            )
 
     @property
     def is_actionable(self) -> bool:
@@ -196,6 +208,8 @@ class Signal:
             time_remaining_s=0,
             reasoning="",
             timestamp=timestamp,
+            contract_price=None,
+            market_overround_bps=None,
             error_msg=error_msg,
         )
 
@@ -220,6 +234,8 @@ class Signal:
             time_remaining_s=0,
             reasoning=reason,
             timestamp=timestamp,
+            contract_price=None,
+            market_overround_bps=None,
         )
 
 

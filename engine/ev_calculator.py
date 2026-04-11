@@ -66,8 +66,12 @@ class EVCalculator:
 
         fee_per_contract = self.fee_per_contract(contract_price)
         fee_total = fee_per_contract * contracts
-        ev_gross = (my_prob - contract_price) * contracts
-        ev_net = ev_gross - fee_total
+        capital_at_risk = contract_price * contracts
+        # ev_gross y ev_net como fracción del capital arriesgado,
+        # para que sean comparables con min_ev_threshold (diseñado como 4 %).
+        ev_gross = (my_prob - contract_price) / contract_price
+        fee_fraction = fee_total / capital_at_risk   # = fee_per_contract / contract_price
+        ev_net = ev_gross - fee_fraction
         min_prob_to_profit = min(1.0, contract_price + fee_per_contract)
 
         return EVResult(

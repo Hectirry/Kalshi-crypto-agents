@@ -45,7 +45,7 @@ class TestDatabaseSchema:
         version = db._conn.execute(
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
-        assert version == 1
+        assert version == 2
 
     def test_initialize_is_idempotent(self, db_path):
         """Llamar initialize() dos veces no debe lanzar excepciones."""
@@ -85,7 +85,7 @@ class TestDatabaseSchema:
 
 class TestSignalPersistence:
     def test_save_and_retrieve_signal(self, db, make_signal):
-        signal = make_signal()
+        signal = make_signal(contract_price=0.57, market_overround_bps=80.0)
         signal_id = db.save_signal(signal)
 
         assert signal_id > 0
@@ -97,7 +97,17 @@ class TestSignalPersistence:
         assert saved.market_ticker      == signal.market_ticker
         assert saved.delta              == signal.delta
         assert saved.ev_net_fees        == signal.ev_net_fees
+        assert saved.contract_price     == 0.57
+        assert saved.market_overround_bps == 80.0
         assert saved.outcome            is None
+
+    def test_migration_v2_adds_signal_microstructure_columns(self, db):
+        columns = {
+            row["name"]
+            for row in db._conn.execute("PRAGMA table_info(signals)").fetchall()
+        }
+        assert "contract_price" in columns
+        assert "market_overround_bps" in columns
 
     def test_update_signal_outcome(self, db, make_signal):
         from core.models import Outcome
@@ -289,6 +299,10 @@ class TestSignal:
         with pytest.raises(ValueError, match="kelly_size"):
             make_signal(kelly_size=1.5)
 
+    def test_negative_market_overround_raises(self, make_signal):
+        with pytest.raises(ValueError, match="market_overround_bps"):
+            make_signal(market_overround_bps=-1.0)
+
 
 class TestTrade:
     def test_valid_trade(self, make_trade):
@@ -328,7 +342,30 @@ class TestConfig:
         cfg = app_config.engine
         assert 0.0 < cfg.min_ev_threshold < 1.0
         assert 0.0 < cfg.kelly_fraction <= 1.0
+        assert 0.0 < cfg.min_contract_price < cfg.max_contract_price < 1.0
+        assert cfg.max_market_overround_bps >= 0.0
         assert cfg.min_time_remaining_s >= 30
+
+    def test_category_override_loaded_from_config(self, app_config):
+        btc = app_config.engine.category_overrides["BTC"]
+        assert btc.min_delta == 0.25
+        assert btc.min_ev_threshold == 0.30
+        assert btc.min_time_remaining_s == 180
+        assert btc.max_contract_price == 0.70
+
+    def test_social_sentiment_defaults_loaded_from_config(self, app_config):
+        cfg = app_config.social_sentiment
+        assert cfg.enabled is False
+        assert cfg.provider == "reddit"
+        assert cfg.supported_assets == ["BTC", "ETH", "SOL"]
+        assert cfg.ttl_s >= cfg.refresh_interval_s
+
+    def test_setup_quality_gate_defaults_loaded_from_config(self, app_config):
+        cfg = app_config.engine
+        assert cfg.setup_quality_gate_enabled is True
+        assert cfg.setup_quality_min_samples == 3
+        assert cfg.setup_quality_min_win_rate == pytest.approx(0.40)
+        assert cfg.setup_quality_history_limit == 500
 
     def test_missing_kalshi_key_raises(self):
         from core.config import load_config
@@ -360,6 +397,22 @@ class TestConfig:
         with patch.dict(os.environ, {"DB_PATH": str(db_path)}, clear=False):
             config = load_config()
             assert config.database.path.parent.exists()
+
+    def test_social_sentiment_env_override(self):
+        from core.config import load_config
+        with patch.dict(
+            os.environ,
+            {
+                "SOCIAL_SENTIMENT_ENABLED": "true",
+                "SOCIAL_SENTIMENT_TTL_S": "1200",
+                "SOCIAL_SENTIMENT_ASSETS": "btc,eth,sol",
+            },
+            clear=False,
+        ):
+            config = load_config()
+            assert config.social_sentiment.enabled is True
+            assert config.social_sentiment.ttl_s == 1200
+            assert config.social_sentiment.supported_assets == ["BTC", "ETH", "SOL"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

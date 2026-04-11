@@ -9,6 +9,7 @@ and records every signal/trade in SQLite for review and backtesting.
 ## What It Does
 
 - Streams spot prices from Binance.
+- Polls Hyperliquid as a second spot source and builds a consensus reference price.
 - Streams and polls crypto markets from Kalshi.
 - Estimates probability edges for 15-minute crypto contracts.
 - Applies timing, expected value, fee, Kelly sizing, and category-blocking rules.
@@ -48,10 +49,24 @@ set -a && source .env && set +a
 python main.py --paper-trade
 ```
 
+Recommended current paper-trading posture:
+
+- `BTC` is enabled again, but with stricter category-specific filters.
+- `ETH` and `SOL` remain enabled.
+- The engine now prevents repeat entries on the same contract ticker.
+- Historical duplicate trades were cleaned from `data/trading.db` using the
+  project cleanup script with backup.
+
 For a full demo run:
 
 ```bash
 python main.py --dry-run
+```
+
+To inspect duplicate-per-ticker history without modifying the DB:
+
+```bash
+python scripts/cleanup_inconsistent_history.py
 ```
 
 ## Dashboard
@@ -88,7 +103,7 @@ engine/       Probability, timing, EV, signal routing, optional LLM validator
 execution/    Paper order execution and position management
 backtesting/  Historical replay, calibration, and category blocking
 dashboard/    FastAPI endpoints and static live dashboard
-scripts/      Smoke tests, terminal dashboard, helper loops
+scripts/      Operational helpers such as database cleanup
 tests/        Unit and integration tests with mocked external APIs
 ```
 
@@ -123,7 +138,11 @@ Optional:
 
 ```bash
 OPENROUTER_API_KEY=...
+OPENCLAW_WORKSPACE=~/.openclaw/workspace
 ```
+
+If `OPENCLAW_WORKSPACE` is set, the bot appends session and trade notes to a
+workspace-compatible Markdown journal under `memory/YYYY-MM-DD.md`.
 
 ## Status
 

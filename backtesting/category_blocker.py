@@ -22,6 +22,7 @@ class CategoryBlockDecision:
     category: str
     win_rate: float
     sample_size: int
+    total_pnl: float
     blocked: bool
     reason: str
 
@@ -82,6 +83,7 @@ class CategoryBlocker:
                     category=category,
                     win_rate=win_rate,
                     sample_size=sample_size,
+                    total_pnl=result.total_pnl,
                     blocked=False,
                     reason="insufficient_sample",
                 )
@@ -93,17 +95,18 @@ class CategoryBlocker:
                 )
                 continue
 
-            if win_rate < self.min_win_rate:
+            if win_rate < self.min_win_rate and result.total_pnl < 0.0:
                 self.db.block_category(
                     category=category,
                     win_rate=win_rate,
                     sample_size=sample_size,
-                    reason="win_rate_below_threshold",
+                    reason="win_rate_and_pnl_below_threshold",
                 )
                 decision = CategoryBlockDecision(
                     category=category,
                     win_rate=win_rate,
                     sample_size=sample_size,
+                    total_pnl=result.total_pnl,
                     blocked=True,
                     reason="blocked",
                 )
@@ -113,6 +116,7 @@ class CategoryBlocker:
                     category=category,
                     win_rate=win_rate,
                     sample_size=sample_size,
+                    total_pnl=result.total_pnl,
                     blocked=False,
                     reason="healthy",
                 )

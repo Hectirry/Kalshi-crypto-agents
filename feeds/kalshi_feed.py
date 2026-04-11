@@ -38,6 +38,10 @@ MAX_RECONNECTS = 5
 _CRYPTO_TICKERS = ("BTC", "ETH", "SOL")
 
 
+class KalshiRateLimitError(ConnectionError):
+    """Raised when Kalshi API returns 429 Too Many Requests."""
+
+
 class KalshiFeed:
     """
     Scanner de mercados Kalshi con filtro crypto + expiración + volumen.
@@ -171,6 +175,49 @@ class KalshiFeed:
             if created_session:
                 await self._close_session()
 
+    async def get_market(self, ticker: str) -> dict | None:
+        """
+        Obtiene los detalles de un mercado específico por ticker via REST.
+
+        Args:
+            ticker: identificador del contrato, ej: "KXBTC-15MIN-B95000".
+
+        Returns:
+            Dict con los datos del mercado, o None si el ticker no existe (404).
+
+        Raises:
+            KalshiRateLimitError: si la API retorna 429 Too Many Requests.
+        """
+        url = f"{self._config.kalshi.base_url}/markets/{ticker}"
+        api_path = urlparse(url).path
+
+        created_session = False
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+            created_session = True
+
+        try:
+            async def _fetch() -> dict | None:
+                headers = self._auth_headers(method="GET", path=api_path)
+                async with self._session.get(url, headers=headers) as resp:
+                    if resp.status == 404:
+                        return None
+                    if resp.status == 429:
+                        raise KalshiRateLimitError(f"Kalshi rate limit para ticker={ticker}")
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return data.get("market", data)
+
+            return await asyncio.wait_for(_fetch(), timeout=10.0)
+        except KalshiRateLimitError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("Kalshi get_market ticker=%s error: %s", ticker, exc)
+            return None
+        finally:
+            if created_session:
+                await self._close_session()
+
     async def stream_markets(self) -> AsyncIterator[MarketSnapshot]:
         """
         Emite MarketSnapshot desde el WS de Kalshi continuamente.
@@ -290,6 +337,8 @@ class KalshiFeed:
                 timestamp=time.time(),
                 category=category,
                 strike=strike,
+                event_ticker=raw.get("event_ticker"),
+                title=raw.get("title"),
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.debug("Error parseando mercado Kalshi: %s → %s", raw, exc)

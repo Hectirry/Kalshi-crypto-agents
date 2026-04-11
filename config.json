@@ -15,16 +15,43 @@
     "symbols": ["BTC", "ETH", "SOL"]
   },
   "engine": {
-    "min_ev_threshold": 0.04,
-    "min_delta": 0.05,
+    "min_ev_threshold": 0.06,
+    "min_delta": 0.12,
     "min_time_remaining_s": 90,
     "min_volume_24h": 100,
     "kelly_fraction": 0.25,
-    "max_position_pct": 0.05
+    "max_position_pct": 0.05,
+    "min_contract_price": 0.10,
+    "max_contract_price": 0.90,
+    "max_market_overround_bps": 150.0,
+    "setup_quality_gate_enabled": true,
+    "setup_quality_min_samples": 3,
+    "setup_quality_min_win_rate": 0.40,
+    "setup_quality_history_limit": 500,
+    "category_overrides": {
+      "BTC": {
+        "min_delta": 0.25,
+        "min_ev_threshold": 0.30,
+        "min_time_remaining_s": 180,
+        "min_contract_price": 0.10,
+        "max_contract_price": 0.70
+      }
+    }
   },
   "database": {
     "path": "./data/trading.db",
     "wal_mode": true,
     "busy_timeout_ms": 5000
+  },
+  "social_sentiment": {
+    "enabled": false,
+    "provider": "reddit",
+    "refresh_interval_s": 300,
+    "ttl_s": 900,
+    "request_timeout_s": 5.0,
+    "cache_path": "./data/social_sentiment_cache.json",
+    "supported_assets": ["BTC", "ETH", "SOL"],
+    "reddit_subreddits": ["CryptoCurrency", "Bitcoin", "ethtrader", "solana"],
+    "max_posts_per_asset": 25
   }
 }

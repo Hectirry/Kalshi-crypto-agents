@@ -1,377 +1,464 @@
-# CLAUDE.md — Kalshi Crypto Trading Bot
+# CLAUDE.md — Kalshi Crypto Agents
 
-> Archivo de contexto para Claude Code y Codex.
-> Leer COMPLETO antes de tocar cualquier archivo del proyecto.
+Guía de contexto para agentes de código como Codex, Claude Code y Minimax.
 
----
-
-## Identidad del proyecto
-
-Sistema de trading automatizado para mercados crypto binarios de 15 minutos en Kalshi.
-El edge es estructural: detectar el lag entre el precio real en Binance/Hyperliquid
-y la probabilidad implícita del contrato en Kalshi, y entrar cuando el delta justifica
-el trade después de fees.
-
-**Repositorio:** `/root/Kalshi-crypto-agents`
-**Entorno:** VPS Ubuntu 24, Python 3.11+, servicio systemd `kalshi-bot.service`
-**Estado:** Todas las fases completas. Bot listo para arrancar con `python main.py`.
+Objetivo: entender rápido cómo funciona el proyecto hoy, qué archivos mandan,
+qué invariantes no deben romperse y cuál es el estado operativo actual.
 
 ---
 
-## Arquitectura de módulos
+## 1. Qué es este proyecto
 
-```
-kalshi_trading/
-├── core/
-│   ├── interfaces.py        # Protocolos abstractos (PriceFeed, MarketScanner, OrderExecutor)
-│   ├── models.py            # Dataclasses canónicas (Signal, Trade, MarketSnapshot)
-│   ├── config.py            # Carga config desde env vars + config.json (sin secrets)
-│   └── database.py          # SQLite — única fuente de verdad, todas las escrituras aquí
-├── feeds/
-│   ├── binance_feed.py      # BinancePriceFeed: WS async BTC/ETH ticks
-│   ├── hyperliquid_feed.py  # HyperliquidFeed: orderbook depth + funding rate
-│   └── kalshi_feed.py       # KalshiFeed: WS precios + orderbook contratos 15min
-├── engine/
-│   ├── probability.py       # ProbabilityEngine: delta prob Kalshi vs Binance
-│   ├── timing.py            # TimingFilter: ventana óptima de entrada por tiempo restante
-│   ├── ev_calculator.py     # EVCalculator: EV neto de fees + Kelly sizing
-│   └── signal_router.py     # SignalRouter: orquesta los tres módulos → decisión final
-├── execution/
-│   ├── order_executor.py    # OrderExecutor: demo loguea, prod llama API — mismo código
-│   └── position_manager.py  # PositionManager: stop loss, take profit, P&L
-├── backtesting/
-│   ├── backtest_runner.py   # BacktestRunner: VectorBT sobre SQLite histórico
-│   ├── category_blocker.py  # CategoryBlocker: auto-block por win rate histórico
-│   └── param_injector.py    # ParamInjector: calibra umbrales → inyecta al agente
-├── dashboard/
-│   └── api_server.py        # FastAPI: endpoints para dashboard HTML existente
-├── tests/
-│   ├── conftest.py          # Fixtures globales: DB en memoria, feeds mock, config test
-│   ├── test_schema.py       # Fase 1: valida schema SQLite y migraciones
-│   ├── test_feeds.py        # Fase 2: feeds con mocks, sin llamadas reales
-│   ├── test_engine.py       # Fase 3: ProbabilityEngine, EVCalculator — casos edge
-│   ├── test_backtesting.py  # Fase 4: BacktestRunner sobre datos sintéticos
-│   └── test_execution.py    # Fase 5: OrderExecutor demo vs prod
-├── config.json              # Solo estructura — valores reales en env vars
-├── CLAUDE.md                # Este archivo
-├── PHASES.md                # Estado de cada fase (actualizar al completar)
-└── requirements.txt
-```
+Bot de trading para mercados crypto binarios cortos de Kalshi.
+
+Hace esto:
+
+- lee precios spot desde Binance y Hyperliquid
+- lee mercados crypto desde Kalshi por WS + REST
+- estima probabilidad propia vs probabilidad implícita del mercado
+- filtra por timing, delta, EV neto de fees y precio del contrato
+- abre trades paper o production
+- persiste señales, trades, outcomes y parámetros calibrados en SQLite
+- recalibra thresholds y bloquea/desbloquea categorías con histórico reciente
+- sirve dashboard FastAPI en `:8090`
+
+El proyecto hoy opera sobre `BTC`, `ETH` y `SOL`.
 
 ---
 
-## Convenciones de código — NO negociables
+## 2. Archivos fuente de verdad
 
-### Estilo
-- **snake_case** para todo: variables, funciones, módulos, parámetros
-- **PascalCase** solo para clases
-- **UPPER_SNAKE_CASE** para constantes en `core/config.py`
-- Type hints obligatorios en todas las funciones públicas
-- Docstrings en todas las clases públicas (formato Google style)
-- Máximo 100 caracteres por línea
-- `ruff` como linter — configuración en `pyproject.toml`
+Si hay dudas, estos archivos mandan sobre la documentación vieja:
 
-### Async
-- Todo IO es `async/await`. Sin `time.sleep()` — usar `asyncio.sleep()`
-- Los feeds publican en `asyncio.Queue` central — nunca llaman directamente al engine
-- Timeout explícito en toda llamada de red: `asyncio.wait_for(coro, timeout=10.0)`
+- [main.py](/root/Kalshi-crypto-agents/main.py): orquestador principal
+- [config.json](/root/Kalshi-crypto-agents/config.json): defaults públicos
+- [core/config.py](/root/Kalshi-crypto-agents/core/config.py): loader y validación real
+- [core/database.py](/root/Kalshi-crypto-agents/core/database.py): schema y acceso SQLite
+- [engine/signal_router.py](/root/Kalshi-crypto-agents/engine/signal_router.py): política de entrada real
+- [execution/order_executor.py](/root/Kalshi-crypto-agents/execution/order_executor.py): sizing y PnL real
+- [execution/position_manager.py](/root/Kalshi-crypto-agents/execution/position_manager.py): gestión de riesgo viva
+- [backtesting/backtest_runner.py](/root/Kalshi-crypto-agents/backtesting/backtest_runner.py): replay alineado con ejecución
+- [backtesting/param_injector.py](/root/Kalshi-crypto-agents/backtesting/param_injector.py): calibración de thresholds
+- [backtesting/category_blocker.py](/root/Kalshi-crypto-agents/backtesting/category_blocker.py): bloqueo/desbloqueo de categorías
 
-### Errores
-- **No `except Exception`** — capturar excepciones específicas siempre
-- Los módulos de engine nunca lanzan hacia afuera — retornan `Signal` con `status=ERROR`
-- Logging estructurado con `structlog` — cada log incluye `module`, `trade_id` si aplica
-- Nivel `ERROR` solo para condiciones que requieren intervención humana
-
-### Seguridad
-- **Cero secrets en código o config.json** — solo en variables de entorno
-- Variables de entorno requeridas: `KALSHI_API_KEY`, `KALSHI_API_SECRET`,
-  `BINANCE_API_KEY`, `HYPERLIQUID_API_KEY`, `ENV` (demo|production)
-- `config.py` lanza `EnvironmentError` explícito si falta alguna variable requerida en prod
-- En demo, las claves de exchanges externos son opcionales (solo Kalshi requerida)
-
-### Tests
-- Framework: `pytest` con `pytest-asyncio`
-- **Cero llamadas reales a APIs en tests** — todo mockeado con fixtures en `conftest.py`
-- Cobertura mínima de módulos `engine/`: 85%
-- Cada función pública tiene al menos: caso normal, caso edge (input extremo), caso error
+Si `CLAUDE.md` contradice esos archivos, el código gana.
 
 ---
 
-## Modelo de datos canónico
+## 3. Estado operativo actual
 
-```python
-# core/models.py — estas son las estructuras que circulan por todo el sistema
+### Política global actual
 
-@dataclass
-class PriceSnapshot:
-    symbol: str          # "BTC" | "ETH"
-    price: float         # precio spot en USD
-    timestamp: float     # unix timestamp con ms
-    source: str          # "binance" | "hyperliquid"
-    bid: float | None = None
-    ask: float | None = None
+Configuración base real en `config.json`:
 
-@dataclass
-class MarketSnapshot:
-    ticker: str          # ej: "KXBTC-15MIN-B95000"
-    implied_prob: float  # precio del contrato Kalshi (0.0 - 1.0)
-    yes_ask: float
-    no_ask: float
-    volume_24h: int
-    time_to_expiry_s: int  # segundos hasta expiración
-    timestamp: float
+- `min_ev_threshold = 0.06`
+- `min_delta = 0.12`
+- `min_time_remaining_s = 90`
+- `max_position_pct = 0.05`
+- `kelly_fraction = 0.25`
+- `min_contract_price = 0.10`
+- `max_contract_price = 0.90`
 
-@dataclass
-class Signal:
-    market_ticker: str
-    decision: str        # "YES" | "NO" | "WAIT" | "SKIP" | "ERROR"
-    my_probability: float
-    market_probability: float
-    delta: float         # my_probability - market_probability
-    ev_net_fees: float   # EV esperado después de fees Kalshi
-    kelly_size: float    # fracción de bankroll recomendada
-    confidence: str      # "HIGH" | "MEDIUM" | "LOW"
-    time_remaining_s: int
-    reasoning: str       # texto libre para logging/debug
-    timestamp: float
-    error_msg: str | None = None
-```
+### Override por categoría
 
----
+Hoy existe override explícito solo para `BTC`:
 
-## Schema SQLite — tablas críticas
+- `min_delta = 0.25`
+- `min_ev_threshold = 0.30`
+- `min_time_remaining_s = 180`
+- `min_contract_price = 0.10`
+- `max_contract_price = 0.70`
 
-El schema vive en `core/database.py`. Las migraciones son aditivas (nunca DROP).
+Interpretación:
 
-```sql
--- Tabla maestra de señales — base del backtesting
-CREATE TABLE signals (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker        TEXT NOT NULL,
-    decision      TEXT NOT NULL,          -- YES|NO|WAIT|SKIP|ERROR
-    my_prob       REAL NOT NULL,
-    market_prob   REAL NOT NULL,
-    delta         REAL NOT NULL,
-    ev_net_fees   REAL NOT NULL,
-    kelly_size    REAL NOT NULL,
-    confidence    TEXT NOT NULL,
-    time_remaining_s INTEGER NOT NULL,
-    reasoning     TEXT,
-    created_at    REAL NOT NULL,          -- unix timestamp
-    outcome       TEXT,                  -- se rellena al expirar: WIN|LOSS|NULL
-    outcome_at    REAL                   -- unix timestamp del outcome
-);
+- `BTC` está habilitado otra vez, pero con filtros bastante más duros
+- `ETH` y `SOL` usan la política global más los parámetros calibrados desde DB
 
--- Trades ejecutados (paper y real)
-CREATE TABLE trades (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    signal_id     INTEGER REFERENCES signals(id),
-    ticker        TEXT NOT NULL,
-    side          TEXT NOT NULL,          -- YES|NO
-    contracts     INTEGER NOT NULL,
-    entry_price   REAL NOT NULL,
-    exit_price    REAL,
-    fee_paid      REAL NOT NULL DEFAULT 0,
-    pnl           REAL,
-    mode          TEXT NOT NULL,          -- demo|production
-    status        TEXT NOT NULL,          -- open|closed|cancelled
-    opened_at     REAL NOT NULL,
-    closed_at     REAL
-);
+### Bloqueos de categoría
 
--- Parámetros calibrados por el backtesting
-CREATE TABLE backtest_params (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    param_key     TEXT NOT NULL,          -- ej: "min_delta_threshold"
-    param_value   REAL NOT NULL,
-    category      TEXT,                  -- NULL = global, o "BTC"|"ETH"
-    win_rate      REAL,                  -- win rate histórico con este param
-    sample_size   INTEGER,
-    valid_from    REAL NOT NULL,
-    valid_until   REAL                   -- NULL = vigente
-);
+La tabla `blocked_categories` se maneja por backtesting.
 
--- Categorías bloqueadas
-CREATE TABLE blocked_categories (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    category      TEXT NOT NULL UNIQUE,
-    win_rate      REAL NOT NULL,
-    sample_size   INTEGER NOT NULL,
-    blocked_at    REAL NOT NULL,
-    reason        TEXT
-);
+Regla actual:
 
--- Índices de rendimiento
-CREATE INDEX idx_signals_ticker ON signals(ticker);
-CREATE INDEX idx_signals_created ON signals(created_at);
-CREATE INDEX idx_signals_outcome ON signals(outcome);
-CREATE INDEX idx_trades_status ON trades(status);
-```
+- no se bloquea una categoría si la muestra es chica
+- no se bloquea una categoría solo por win rate bajo
+- para bloquear debe haber `win_rate` bajo y `PnL` negativo
+
+### Estado de la base tras limpieza
+
+Se limpió el churn viejo de trades repetidos por `ticker`.
+
+Script usado:
+
+- [scripts/cleanup_inconsistent_history.py](/root/Kalshi-crypto-agents/scripts/cleanup_inconsistent_history.py)
+
+Último backup creado por esa limpieza:
+
+- `/root/Kalshi-crypto-agents/data/trading.backup-20260411T151755Z.db`
+
+La limpieza eliminó trades incompatibles con la política actual de una sola
+entrada por contrato.
 
 ---
 
-## Variables de entorno (.env)
+## 4a. Analytics de calidad de ejecución
+
+Módulo nuevo: `analytics/execution_quality.py`
+
+Qué hace:
+
+- analiza señales resueltas (outcome IS NOT NULL) con su trade cerrado asociado
+- agrupa por categoría (BTC/ETH/SOL), bucket de overround (0-50/50-100/100-150/150+bps) y bucket de delta
+- métricas por grupo: `sample_size`, `win_rate`, `total_pnl`, `avg_pnl`, `avg_contract_price`, `avg_overround_bps`, `avg_delta`, `avg_entry_edge_bps`
+- `avg_entry_edge_bps` = `(my_prob - contract_price) * 10_000` — mide el edge real pagado vs estimación propia
+- `suggested_max_overround_bps` — límite inferior del primer bucket de overround con `avg_pnl < 0` y muestra ≥ 3; útil para recalibrar `max_market_overround_bps` en config
+
+Endpoint nuevo: `GET /analytics/execution-quality?limit=500`
+
+- retorna JSON con `total_resolved`, `overall_win_rate`, `overall_pnl`, `suggested_max_overround_bps`, `by_category`, `by_overround_bucket`, `by_delta_bucket`
+- estable y testeado
+
+Interfaz de recalibración:
+
+- `_suggest_overround_threshold(by_overround_bucket, OVERROUND_BUCKETS, min_samples=3)` — retorna el umbral candidato o `None`
+- los datos disponibles en `by_overround_bucket` permiten identificar manualmente qué rangos destruyen PnL
+
+DB:
+
+- nuevo método `Database.fetch_resolved_signals_with_trades(limit)` — INNER JOIN signals/trades, solo cerrados y resueltos, sin SQL en otros módulos
+
+---
+
+## 4. Arquitectura real
+
+### Config y modelos
+
+- `core/models.py`
+  - `PriceSnapshot`, `MarketSnapshot`, `Signal`, `Trade`
+- `core/config.py`
+  - carga `config.json` + env vars
+  - soporta `EngineCategoryOverride`
+  - valida modo `demo|production`
+  - exige credenciales de Kalshi siempre
+  - exige Binance/Hyperliquid solo en production
+
+### Feeds
+
+- `feeds/binance_feed.py`
+- `feeds/hyperliquid_feed.py`
+- `feeds/kalshi_feed.py`
+
+### Engine
+
+- `engine/probability.py`
+  - estima `my_prob`
+  - clasifica zonas temporales `NEAR|MID|FAR`
+- `engine/timing.py`
+  - decide si vale la pena entrar por tiempo restante
+- `engine/ev_calculator.py`
+  - calcula EV neto y Kelly
+- `engine/price_resolver.py`
+  - consolida precio de referencia desde múltiples fuentes
+- `engine/signal_router.py`
+  - aplica política completa de entrada
+- `engine/context_builder.py`
+  - arma contexto histórico para el agente LLM
+- `engine/openrouter_agent.py`
+  - segunda opinión opcional solo para señales `MEDIUM`
+- `engine/setup_quality.py`
+  - gate local por calidad histórica del mismo setup
+  - si hay suficiente muestra resuelta y el win rate histórico es malo, se fuerza `SKIP`
+
+### Inteligencia auxiliar
+
+- `intelligence/social_sentiment.py`
+  - servicio opcional en background con caché en memoria + disco
+  - nunca hace fetch dentro de `SignalRouter.evaluate_async(...)`
+  - si falla la fuente, conserva el último snapshot válido y trading sigue
+- `intelligence/reddit_provider.py`
+  - provider inicial sobre Reddit JSON
+  - resume solo `BTC`, `ETH`, `SOL`
+  - entrega métricas compactas, no texto crudo
+
+### Ejecución
+
+- `execution/order_executor.py`
+  - paper y production comparten la misma estructura
+  - el sizing real es `ceil(signal.kelly_size * contracts_multiplier)`
+  - `contracts_multiplier` default = `100`
+- `execution/position_manager.py`
+  - mantiene `open_positions`
+  - mantiene `traded_tickers`
+  - evita reentrada del mismo `ticker`
+  - aplica SL/TP
+  - computa snapshot de observabilidad
+
+### Backtesting y recalibración
+
+- `backtesting/backtest_runner.py`
+  - replay de señales persistidas
+  - usa el mismo sizing por contratos que el executor
+  - deduplica por `ticker`
+  - si recibe `config`, replica la política activa del router
+- `backtesting/param_injector.py`
+  - calibra `min_delta` y `min_ev_threshold`
+  - deduplica por `ticker`
+  - rankea por `avg_pnl` y luego por `win_rate`
+- `backtesting/category_blocker.py`
+  - bloquea/desbloquea según replay reciente
+- `backtesting/outcome_resolver.py`
+  - resuelve `outcome` real de señales expiradas
+
+### Observabilidad y memoria
+
+- `dashboard/api_server.py`
+  - dashboard FastAPI + frontend estático
+- `memory/openclaw_adapter.py`
+  - journal opcional si `OPENCLAW_WORKSPACE` está configurado
+
+---
+
+## 5. Flujo principal
+
+El flujo real vive en [main.py](/root/Kalshi-crypto-agents/main.py).
+
+### Arranque
+
+1. parsea CLI
+2. resuelve `paper_trade`
+3. carga config
+4. abre DB
+5. lee bloqueos/params actuales
+6. corre `_maybe_recalibrate(...)`
+7. arranca el orquestador async
+
+### Tareas principales del orquestador
+
+- `_price_task`
+- `_market_task`
+- `_rest_poll_task`
+- `_supervisor_task`
+- `_recal_task`
+- `_outcome_task`
+- `_serve_dashboard`
+- `social_sentiment`
+  - tarea opcional activada por config/env
+  - refresca snapshots fuera del hot path y los persiste en cache local
+
+### Procesamiento de mercado
+
+En `_process_market(...)`:
+
+1. si el contrato va a expirar pronto, cierra posiciones del ticker
+2. evalúa SL/TP sobre posiciones abiertas
+3. evita reentrada si el ticker ya fue operado
+4. resuelve precio de referencia externo
+5. genera señal con `SignalRouter`
+6. chequea `go/no-go`
+7. intenta abrir trade
+
+---
+
+## 6. Semántica de paper mode y production
+
+Esto es importante.
+
+### Resolución del modo real
+
+En `main.py`, `_resolve_execution_mode(cfg, paper_trade)` hace esto:
+
+- si `paper_trade=True` -> executor `demo`
+- si `cfg.is_demo` -> executor `demo`
+- si `cfg.is_production` y `paper_trade=False` -> executor `production`
+
+Eso significa:
+
+- `--dry-run` fuerza entorno demo completo
+- `--paper-trade` usa datos de producción pero NO manda órdenes reales
+- `PAPER_TRADE=true` también fuerza executor `demo`
+
+### Invariante
+
+Nunca romper esto:
+
+- `ENV=production` + `paper_trade=True` debe seguir usando executor `demo`
+
+Hay tests cubriendo eso.
+
+---
+
+## 7. Invariantes importantes
+
+### Trading
+
+- un `ticker` solo debe operarse una vez
+- no reabrir contratos ya operados
+- paper y backtest deben compartir la misma lógica de sizing
+- el replay debe parecerse a la ejecución real, no a una simulación abstracta
+- sentimiento social nunca puede convertirse en dependencia crítica del loop
+- el LLM lo usa solo como contexto secundario y explícitamente puede venir ausente
+
+### Riesgo
+
+- `PositionManager.go_no_go_status()` decide si se puede seguir operando
+- no detener categorías sanas solo por win rate bajo si el PnL sigue siendo positivo
+- `max_drawdown_pct` se mide contra bankroll inicial
+- el gate `setup_quality` usa solo histórico resuelto local; no depende de red
+
+### DB
+
+- todas las escrituras pasan por `core/database.py`
+- migraciones son aditivas
+- no meter SQL directo en otros módulos
+- `signals` y `trades` son la historia operacional
+
+---
+
+## 8. Backtesting: cómo pensar su resultado
+
+El backtest actual no evalúa "todas las señales crudas".
+
+Si se instancia con `config`, el runner:
+
+1. filtra señales por política activa
+2. deduplica por `ticker`
+3. usa el mismo sizing por contratos del executor
+4. calcula PnL neto con fees de entrada y salida
+
+Esto fue una corrección importante respecto a versiones anteriores.
+
+Conclusión:
+
+- si se cambia la política del router, conviene revisar también el replay
+- si se cambia el sizing real, conviene revisar también el runner
+
+---
+
+## 9. Base de datos y limpieza
+
+Archivo principal:
+
+- `/root/Kalshi-crypto-agents/data/trading.db`
+
+Script de inspección/limpieza:
+
+- [scripts/cleanup_inconsistent_history.py](/root/Kalshi-crypto-agents/scripts/cleanup_inconsistent_history.py)
+
+Qué hace:
+
+- encuentra trades repetidos por `ticker`
+- conserva el primero por orden temporal
+- borra el resto solo con `--apply`
+- crea backup automático antes de borrar
+
+Uso:
 
 ```bash
-# .env (NUNCA commitear este archivo)
-ENV=demo                          # demo | production
-PAPER_TRADE=true                  # descomentar para paper trading con API real
-KALSHI_API_KEY=your_key
-KALSHI_API_SECRET=your_secret
-KALSHI_API_KEY_ID=your_key_id    # para RSA-PSS
-KALSHI_PRIVATE_KEY_PATH=/root/Kalshi-crypto-agents/KalshiApiSecret.pem
-BINANCE_API_KEY=your_key          # opcional en demo
-HYPERLIQUID_API_KEY=your_key      # opcional en demo
-OPENROUTER_API_KEY=your_key       # para el agente LLM
-LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
-DB_PATH=/root/kalshi_trading/data/trading.db
+python scripts/cleanup_inconsistent_history.py
+python scripts/cleanup_inconsistent_history.py --apply
 ```
+
+No usar este script a ciegas en una base nueva sin entender el criterio.
 
 ---
 
-## Fee schedule Kalshi (octubre 2025)
+## 10. Variables de entorno importantes
 
-Crítico para EVCalculator — fees destruyen trades marginales.
+Mínimas para arrancar:
 
-```
-fee = min(0.07 * contracts, 0.07 * contracts * (1 - |price - 0.5| / 0.5))
+- `ENV`
+- `KALSHI_API_KEY_ID` o `KALSHI_API_KEY`
 
-Simplificado: fee por contrato = precio * (1 - precio) * 0.07 / (precio * 1)
-A precio 0.50 → fee máximo ~$0.0175 por contrato
-A precio 0.80 → fee ~$0.0112 por contrato
-A precio 0.95 → fee ~$0.0033 por contrato
+En production real además:
 
-Regla práctica: delta mínimo necesario para ser rentable:
-  min_delta = (2 * fee_per_contract) / (1.0 - fee_per_contract)
-```
+- `KALSHI_PRIVATE_KEY_PATH`
+- `BINANCE_API_KEY`
+- `HYPERLIQUID_API_KEY`
 
----
+Opcionales:
 
-## Reglas del agente de decisión
-
-```
-decision = SKIP   si  ev_net_fees <= 0
-decision = SKIP   si  time_remaining_s < 90       # menos de 90s → demasiado tarde
-decision = SKIP   si  categoria en blocked_categories
-decision = WAIT   si  0 < ev_net_fees < MIN_EV_THRESHOLD  # señal débil
-decision = WAIT   si  confidence == "LOW"
-decision = YES    si  ev_net_fees >= MIN_EV_THRESHOLD AND delta > 0 AND confidence in (HIGH, MEDIUM)
-decision = NO     si  ev_net_fees >= MIN_EV_THRESHOLD AND delta < 0 AND confidence in (HIGH, MEDIUM)
-
-MIN_EV_THRESHOLD se calibra por VectorBT — valor inicial: 0.04 (4% EV neto)
-```
+- `OPENROUTER_API_KEY`
+- `OPENCLAW_WORKSPACE`
+- `BANKROLL_USD`
+- `DB_PATH`
+- `PAPER_TRADE`
+- `LOG_LEVEL`
 
 ---
 
-## Arranque rápido
+## 11. Comandos útiles
+
+### Paper trading con datos reales
 
 ```bash
 cd /root/Kalshi-crypto-agents
-source .venv/bin/activate
 set -a && source .env && set +a
-
-# Demo (sin API real): paper trading en modo dry-run
-python main.py --dry-run
-
-# Paper trading real (API Kalshi de producción, órdenes simuladas)
 python main.py --paper-trade
+```
 
-# Trading real (requiere API keys con permisos de trading en .env)
-python main.py
+### Demo completo
 
-# Solo recalibrar parámetros y salir
+```bash
+python main.py --dry-run
+```
+
+### Solo recalibrar y salir
+
+```bash
 python main.py --backtest-only
 ```
 
-**Dashboard:**
-- API health: `http://localhost:8090/health`
-- Estado del sistema: `http://localhost:8090/state`
-- Dashboard HTML: `http://localhost:8091/kalshi_scanner_dashboard.html` (si está servido)
-
----
-
-## Autenticación RSA-PSS (Kalshi)
-
-Variables de entorno requeridas para firma de requests:
+### Dashboard
 
 ```bash
-KALSHI_API_KEY_ID=tu_key_id
-KALSHI_PRIVATE_KEY_PATH=/root/Kalshi-crypto-agents/KalshiApiSecret.pem
+curl -s http://localhost:8090/health
+curl -s http://localhost:8090/state
 ```
 
-El `KalshiFeed` selecciona automáticamente RSA-PSS si `KALSHI_PRIVATE_KEY_PATH` está
-presente, y cae al Bearer legacy si no. En producción, `KALSHI_PRIVATE_KEY_PATH` es
-obligatorio o el arranque falla con `EnvironmentError`.
-
----
-
-## Agente OpenRouter (opcional)
-
-Si `OPENROUTER_API_KEY` está en el entorno, el `SignalRouter` consulta al LLM
-para señales con `confidence=MEDIUM`. Timeout estricto de 3s — nunca bloquea.
+### Tests más relevantes
 
 ```bash
-OPENROUTER_API_KEY=tu_openrouter_key
+pytest tests/test_engine.py tests/test_backtesting.py tests/test_execution.py tests/test_integration.py tests/test_schema.py
 ```
 
 ---
 
-## Estado de fases (actualizar aquí al completar)
+## 12. Qué revisar antes de tocar estrategia
 
-| Fase | Módulos | Estado | Puerta de salida |
-|------|---------|--------|-----------------|
-| 1 | interfaces, models, config, database | COMPLETA | 51/51 tests ✓ |
-| 2 | binance_feed, hyperliquid_feed, kalshi_feed | COMPLETA | 100/100 tests ✓ |
-| 3 | probability, timing, ev_calculator, signal_router | COMPLETA | 126/126 tests ✓ |
-| 4 | backtest_runner, category_blocker, param_injector | COMPLETA | 134/134 tests ✓ |
-| 5 | order_executor, observabilidad, GO/NO-GO | COMPLETA | 145/145 tests ✓ |
-| 6 | main.py, openrouter_agent, integración | COMPLETA | test_integration ✓ |
+Si el bot vuelve a perder o el replay se ve raro, revisar en este orden:
 
----
-
-## Archivos del sistema base (NO borrar, solo extender)
-
-```
-kalshi_volume_scanner.py   → migrar lógica a feeds/kalshi_feed.py
-whale_following_bot.py     → migrar lógica a execution/
-crypto_agent.py            → migrar lógica a engine/signal_router.py
-openrouter_client.py       → mantener, usar en engine/
-kalshi_scanner_dashboard.html → mantener, conectar a dashboard/api_server.py
-```
+1. `SignalRouter` y sus thresholds efectivos por categoría
+2. `BacktestRunner` y si está alineado con la política activa
+3. trades repetidos por `ticker` en la DB
+4. si `paper_trade` está usando modo `demo` o no
+5. resolución de outcomes
+6. diferencias entre `config.json`, params calibrados en DB y bloqueos activos
 
 ---
 
-## Comandos de operación
+## 13. Qué NO asumir
 
-```bash
-# Ver qué está corriendo en puertos
-ss -tlnp | grep -E "8090|8091"
-
-# Matar procesos del bot
-pkill -f "python main.py"
-
-# Matar proceso que ocupa puerto 8090
-kill -9 $(fuser 8090/tcp 2>/dev/null)
-
-# Correr tests
-cd /root/Kalshi-crypto-agents && pytest tests/ -v --tb=short
-
-# Ver logs en tiempo real (si hay servicio systemd)
-journalctl -u kalshi-bot.service -f
-
-# Ver estado del bot por API
-curl http://localhost:8090/state | python3 -m json.tool
-```
+- no asumir que `BTC` usa la misma política que `ETH`/`SOL`
+- no asumir que todos los trades históricos son comparables
+- no asumir que `paper_trade` y `production` comparten cliente de ejecución
+- no asumir que `CLAUDE.md` está al día sin contrastarlo con el código
 
 ---
 
-## Anti-patrones prohibidos
+## 14. Última validación conocida
 
-- `except Exception:` o `except:` sin tipo específico
-- `print()` para debug — usar `logger.debug()`
-- Secrets en cualquier archivo que no sea `.env`
-- `time.sleep()` en código async
-- Lógica de negocio en `__main__` o scripts sueltos
-- Llamadas a API reales en tests
-- `if ENV == "demo":` dispersos — solo en `OrderExecutor`
-- Modificar schema SQLite con DROP o ALTER COLUMN — solo agregar columnas/tablas
+Última suite relevante ejecutada durante los ajustes recientes:
+
+- `214 passed, 5 skipped` (incluye 38 tests nuevos en `tests/test_analytics.py`)
+
+Último replay alineado con política actual:
+
+- `BTC`: 24 trades, `PnL=+4.378`
+- `ETH`: 21 trades, `PnL=+6.1655`
+- `SOL`: 48 trades, `PnL=+29.6095`
+
+Último estado conocido de `blocked_categories` tras recalibración:
+
+- vacío
+
+Tomar esto como referencia operativa, no como verdad eterna.

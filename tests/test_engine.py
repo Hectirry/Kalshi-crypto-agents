@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import math
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.models import Confidence, Decision
+from core.models import Confidence, Decision, Outcome
 from engine.ev_calculator import EVCalculator
 from engine.probability import (
     DEFAULT_VOLATILITY_1M,
+    MAX_PROBABILITY,
+    MIN_PROBABILITY,
     MOMENTUM_DRIFT_SCALE,
     ProbabilityEngine,
     TimeZone,
@@ -501,8 +503,8 @@ class TestSignalRouter:
         make_market_snapshot,
         make_price_snapshot,
     ):
-        db.upsert_param("min_delta", 0.01, "BTC", win_rate=0.62, sample_size=40)
-        db.upsert_param("min_ev_threshold", 0.50, "BTC", win_rate=0.62, sample_size=40)
+        db.upsert_param("min_delta", 0.01, "ETH", win_rate=0.62, sample_size=40)
+        db.upsert_param("min_ev_threshold", 0.50, "ETH", win_rate=0.62, sample_size=40)
         router, prob_engine, ev_calc, timing_filter = self._make_router(app_config, db)
         timing_filter.should_enter.side_effect = [
             MagicMock(allowed=True, reason="ok"),
@@ -525,13 +527,74 @@ class TestSignalRouter:
         )
 
         signal = router.evaluate(
-            market=make_market_snapshot(category="BTC"),
+            market=make_market_snapshot(category="ETH", ticker="KXETH-15MIN-B3200"),
             price=make_price_snapshot(),
             bankroll=1_000.0,
         )
 
         assert signal.decision == Decision.SKIP
         assert signal.reasoning == "ev_negative"
+
+    def test_contract_price_out_of_range_skips(self, app_config, db, make_market_snapshot, make_price_snapshot):
+        router, prob_engine, ev_calc, timing_filter = self._make_router(app_config, db)
+        timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.98,
+            market_prob=0.85,
+            delta=0.13,
+            confidence=Confidence.HIGH,
+        )
+
+        signal = router.evaluate(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3200",
+                implied_prob=0.92,
+                yes_ask=0.93,
+                no_ask=0.08,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        assert signal.decision == Decision.SKIP
+        assert signal.reasoning == "contract_price_out_of_range"
+        ev_calc.calculate.assert_not_called()
+
+    def test_btc_category_override_requires_stricter_time_and_edge(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+    ):
+        router, prob_engine, ev_calc, timing_filter = self._make_router(app_config, db)
+        timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=False, reason="too_late"),
+        ]
+        prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.95,
+            market_prob=0.60,
+            delta=0.35,
+            confidence=Confidence.HIGH,
+        )
+
+        signal = router.evaluate(
+            market=make_market_snapshot(category="BTC", implied_prob=0.60, yes_ask=0.61, time_to_expiry_s=120),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        assert signal.decision == Decision.SKIP
+        assert signal.reasoning == "too_late"
+        prob_engine.estimate.assert_not_called()
 
     def test_router_does_not_use_volume_as_volatility(
         self,
@@ -665,7 +728,7 @@ class TestSignalRouter:
         db.save_signal = MagicMock(wraps=db.save_signal)
 
         signal = router.evaluate(
-            market=make_market_snapshot(implied_prob=0.55, yes_ask=0.56),
+            market=make_market_snapshot(category="ETH", ticker="KXETH-15MIN-B3200", implied_prob=0.55, yes_ask=0.56),
             price=make_price_snapshot(),
             bankroll=1_000.0,
         )
@@ -726,7 +789,13 @@ class TestSignalRouter:
         db.save_signal = MagicMock(wraps=db.save_signal)
 
         signal = router.evaluate(
-            market=make_market_snapshot(implied_prob=0.55, yes_ask=0.56, no_ask=0.45),
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3200",
+                implied_prob=0.55,
+                yes_ask=0.56,
+                no_ask=0.45,
+            ),
             price=make_price_snapshot(),
             bankroll=1_000.0,
         )
@@ -766,7 +835,13 @@ class TestSignalRouter:
         ev_calc.kelly_size.return_value = 0.04
 
         signal = router.evaluate(
-            market=make_market_snapshot(implied_prob=0.55, yes_ask=0.56, no_ask=0.44),
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3200",
+                implied_prob=0.55,
+                yes_ask=0.56,
+                no_ask=0.44,
+            ),
             price=make_price_snapshot(),
             bankroll=1_000.0,
         )
@@ -857,7 +932,7 @@ class TestSignalRouter:
         ]
         ev_calc.kelly_size.return_value = 0.05
 
-        market = make_market_snapshot()
+        market = make_market_snapshot(category="ETH", ticker="KXETH-15MIN-B3200")
         price = make_price_snapshot()
 
         skip_delta = router.evaluate(market=market, price=price, bankroll=1_000.0)
@@ -868,3 +943,413 @@ class TestSignalRouter:
         assert skip_ev.decision == Decision.SKIP
         assert valid.decision == Decision.YES
         assert db.save_signal.call_count == 3
+
+    def test_build_agent_context_uses_only_resolved_history(self, db, make_market_snapshot, make_signal):
+        from engine.context_builder import build_agent_context
+        from intelligence.social_sentiment import SocialSentimentSnapshot
+
+        now = time.time()
+        db.save_signal(
+            make_signal(
+                market_ticker="KXBTC-15MIN-B95000",
+                timestamp=now - 300,
+                time_remaining_s=420,
+                decision=Decision.YES,
+                delta=0.11,
+                ev_net_fees=0.08,
+                outcome=Outcome.WIN,
+                outcome_at=now - 100,
+            )
+        )
+        db.save_signal(
+            make_signal(
+                market_ticker="KXBTC-15MIN-B96000",
+                timestamp=now - 240,
+                time_remaining_s=390,
+                decision=Decision.NO,
+                delta=-0.09,
+                ev_net_fees=0.05,
+                outcome=Outcome.LOSS,
+                outcome_at=now - 90,
+            )
+        )
+        db.save_signal(
+            make_signal(
+                market_ticker="KXBTC-15MIN-B97000",
+                timestamp=now - 180,
+                time_remaining_s=380,
+                decision=Decision.YES,
+                delta=0.07,
+                ev_net_fees=0.03,
+                outcome=None,
+            )
+        )
+
+        market = make_market_snapshot(
+            ticker="KXBTC-15MIN-B95000",
+            category="BTC",
+            time_to_expiry_s=450,
+            timestamp=now,
+        )
+        signal = make_signal(market_ticker=market.ticker, timestamp=now, time_remaining_s=450)
+        social_sentiment = SocialSentimentSnapshot(
+            symbol="BTC",
+            source="reddit",
+            sentiment_score=0.35,
+            mention_count=11,
+            bullish_ratio=0.55,
+            bearish_ratio=0.18,
+            acceleration=0.20,
+            confidence=0.72,
+            age_seconds=45,
+            updated_at=now - 45,
+        )
+
+        context = build_agent_context(
+            db=db,
+            market=market,
+            signal=signal,
+            social_sentiment=social_sentiment,
+        )
+
+        assert context.overall.sample_size == 2
+        assert context.overall.wins == 1
+        assert context.same_category.sample_size == 2
+        assert context.same_ticker.sample_size == 1
+        assert context.same_direction.sample_size == 1
+        assert context.same_setup.sample_size == 1
+        assert len(context.recent_same_category) == 2
+        assert len(context.recent_same_setup) == 1
+        assert all(entry.outcome in {"WIN", "LOSS"} for entry in context.recent_same_category)
+        assert context.social_sentiment == social_sentiment
+
+    @pytest.mark.asyncio
+    async def test_evaluate_async_passes_outcome_backed_context_to_agent(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+        make_signal,
+    ):
+        from engine.context_builder import AgentContext
+        from engine.openrouter_agent import AgentVerdict
+        from intelligence.social_sentiment import SocialSentimentSnapshot
+
+        db.save_signal(
+            make_signal(
+                market_ticker="KXETH-15MIN-B3200",
+                timestamp=time.time() - 300,
+                time_remaining_s=420,
+                decision=Decision.YES,
+                delta=0.10,
+                ev_net_fees=0.06,
+                outcome=Outcome.WIN,
+                outcome_at=time.time() - 200,
+            )
+        )
+        mock_agent = AsyncMock()
+        mock_agent.consult = AsyncMock(
+            return_value=AgentVerdict(
+                proceed=True,
+                adjusted_kelly=0.05,
+                reasoning="ok",
+                tokens_used=12,
+            )
+        )
+        mock_social_sentiment = MagicMock()
+        mock_social_sentiment.get_snapshot.return_value = SocialSentimentSnapshot(
+            symbol="ETH",
+            source="reddit",
+            sentiment_score=0.20,
+            mention_count=8,
+            bullish_ratio=0.50,
+            bearish_ratio=0.13,
+            acceleration=0.25,
+            confidence=0.61,
+            age_seconds=90,
+            updated_at=time.time() - 90,
+        )
+
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=app_config.engine,
+            db=db,
+            blocked_categories=set(),
+            openrouter_agent=mock_agent,
+            social_sentiment_service=mock_social_sentiment,
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.70,
+            market_prob=0.55,
+            delta=0.15,
+            confidence=Confidence.MEDIUM,
+        )
+        router.ev_calc.calculate.return_value = MagicMock(
+            ev_gross=0.08,
+            fee_total=0.01,
+            ev_net=0.07,
+            is_profitable=True,
+            min_prob_to_profit=0.57,
+        )
+        router.ev_calc.kelly_size.return_value = 0.05
+
+        await router.evaluate_async(
+            market=make_market_snapshot(category="ETH", ticker="KXETH-15MIN-B3200"),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        consult_kwargs = mock_agent.consult.await_args.kwargs
+        assert isinstance(consult_kwargs["context"], AgentContext)
+        assert consult_kwargs["context"].same_ticker.sample_size == 1
+        assert consult_kwargs["context"].same_category.sample_size >= 1
+        assert consult_kwargs["context"].live_features is not None
+        assert consult_kwargs["context"].social_sentiment is not None
+        assert consult_kwargs["context"].social_sentiment.symbol == "ETH"
+        assert 0.0 <= consult_kwargs["context"].live_features.rsi_14 <= 100.0
+
+    def test_setup_quality_gate_skips_historically_weak_setup(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+        make_signal,
+    ):
+        from dataclasses import replace
+
+        weak_cfg = replace(
+            app_config.engine,
+            setup_quality_gate_enabled=True,
+            setup_quality_min_samples=3,
+            setup_quality_min_win_rate=0.40,
+        )
+        base_ts = time.time()
+        for idx in range(3):
+            db.save_signal(
+                make_signal(
+                    market_ticker=f"KXETH-15MIN-B32{idx}",
+                    decision=Decision.YES,
+                    delta=0.15,
+                    time_remaining_s=420,
+                    timestamp=base_ts - (300 - idx),
+                    outcome=Outcome.LOSS,
+                    outcome_at=base_ts - (200 - idx),
+                )
+            )
+
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=weak_cfg,
+            db=db,
+            blocked_categories=set(),
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.70,
+            market_prob=0.55,
+            delta=0.15,
+            confidence=Confidence.HIGH,
+        )
+        router.ev_calc.calculate.return_value = MagicMock(
+            ev_gross=0.08,
+            fee_total=0.01,
+            ev_net=0.07,
+            is_profitable=True,
+            min_prob_to_profit=0.57,
+        )
+        router.ev_calc.kelly_size.return_value = 0.05
+
+        signal = router.evaluate(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3300",
+                time_to_expiry_s=420,
+                timestamp=base_ts,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        assert signal.decision == Decision.SKIP
+        assert "setup_quality_gate" in signal.reasoning
+
+    def test_market_too_wide_skips_before_ev(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+    ):
+        from dataclasses import replace
+
+        cfg = replace(app_config.engine, max_market_overround_bps=100.0)
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=cfg,
+            db=db,
+            blocked_categories=set(),
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.70,
+            market_prob=0.55,
+            delta=0.15,
+            confidence=Confidence.HIGH,
+        )
+
+        signal = router.evaluate(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3200",
+                implied_prob=0.55,
+                yes_ask=0.60,
+                no_ask=0.45,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        assert signal.decision == Decision.SKIP
+        assert signal.reasoning == "market_too_wide"
+        assert signal.contract_price == 0.60
+        assert signal.market_overround_bps == pytest.approx(500.0)
+        router.ev_calc.calculate.assert_not_called()
+
+
+# ── Fix 1: my_prob clamping ───────────────────────────────────────────────────
+
+class TestMyProbClamping:
+    """Verifica que ProbabilityEngine clampea my_prob a [0.01, 0.99] siempre."""
+
+    def test_spot_far_above_strike_clamps_to_max(
+        self, make_market_snapshot, make_price_snapshot
+    ):
+        """Precio spot muy por encima del strike → my_prob == 0.99."""
+        engine = ProbabilityEngine()
+        # Strike 90k, spot 200k: probabilidad casi-segura de que el contrato expire ITM.
+        market = make_market_snapshot(strike=90_000.0, implied_prob=0.90, time_to_expiry_s=600)
+        price = make_price_snapshot(price=200_000.0)
+
+        result = engine.estimate(market=market, price=price, volatility_1m=0.0001)
+
+        assert result.my_prob == MAX_PROBABILITY  # 0.99
+
+    def test_spot_far_below_strike_clamps_to_min(
+        self, make_market_snapshot, make_price_snapshot
+    ):
+        """Precio spot muy por debajo del strike → my_prob == 0.01."""
+        engine = ProbabilityEngine()
+        # Strike 200k, spot 50k: probabilidad casi-nula de expirar ITM.
+        market = make_market_snapshot(strike=200_000.0, implied_prob=0.10, time_to_expiry_s=600)
+        price = make_price_snapshot(price=50_000.0)
+
+        result = engine.estimate(market=market, price=price, volatility_1m=0.0001)
+
+        assert result.my_prob == MIN_PROBABILITY  # 0.01
+
+    def test_intermediate_probabilities_not_modified_by_clamp(
+        self, make_market_snapshot, make_price_snapshot
+    ):
+        """Probabilidades intermedias (0.3–0.7) pasan sin modificar por el clamp."""
+        engine = ProbabilityEngine()
+        # Spot cerca del strike → modelo produce probabilidad en zona media.
+        market = make_market_snapshot(strike=95_000.0, implied_prob=0.55, time_to_expiry_s=450)
+        price = make_price_snapshot(price=95_200.0)
+
+        result = engine.estimate(market=market, price=price, volatility_1m=0.005)
+
+        # El resultado debe ser interior al rango — no tocado por el clamp.
+        assert result.my_prob > MIN_PROBABILITY
+        assert result.my_prob < MAX_PROBABILITY
+        assert result.my_prob not in (MIN_PROBABILITY, MAX_PROBABILITY)
+
+
+# ── Fix 2: EV units normalization ─────────────────────────────────────────────
+
+class TestEVNormalized:
+    """Verifica que ev_net es fracción del capital arriesgado, comparable con min_ev_threshold=0.04."""
+
+    def test_profitable_trade_ev_above_threshold(self):
+        """Caso 1 — trade rentable: ev_net > 0.04 con edge claro."""
+        calc = EVCalculator()
+        # capital_at_risk = 0.55 * 10 = $5.50
+        # ev_gross = (0.70 - 0.55) / 0.55 ≈ 0.2727
+        # fee_fraction = fee_per_contract(0.55) / 0.55 ≈ 0.0315
+        # ev_net ≈ 0.241 > 0.04
+        result = calc.calculate(
+            my_prob=0.70,
+            contract_price=0.55,
+            contracts=10,
+            bankroll=100.0,
+        )
+
+        assert result.ev_gross > 0.0
+        assert result.ev_net > 0.04
+        assert result.is_profitable is True
+
+    def test_marginal_trade_ev_below_threshold(self):
+        """Caso 2 — trade marginal: fees casi destruyen el edge, ev_net < 0.04."""
+        calc = EVCalculator()
+        # ev_gross = (0.57 - 0.55) / 0.55 ≈ 0.0364
+        # fee_fraction ≈ 0.0315
+        # ev_net ≈ 0.005 → positivo pero muy por debajo del umbral 0.04
+        result = calc.calculate(
+            my_prob=0.57,
+            contract_price=0.55,
+            contracts=10,
+            bankroll=100.0,
+        )
+
+        assert result.ev_net < 0.04  # router lo filtraría con min_ev_threshold=0.04
+        assert result.ev_gross > 0.0  # hay algo de edge bruto
+
+    def test_no_edge_zero_kelly_negative_ev(self):
+        """Caso 3 — sin edge (my_prob <= price): kelly=0.0 y ev_net negativo."""
+        calc = EVCalculator()
+        result = calc.calculate(
+            my_prob=0.54,
+            contract_price=0.55,
+            contracts=1,
+            bankroll=100.0,
+        )
+        kelly = calc.kelly_size(my_prob=0.54, contract_price=0.55)
+
+        assert kelly == 0.0
+        assert result.ev_net < 0.0
+
+    def test_extreme_price_near_certain_positive_ev(self):
+        """Caso 4 — precio extremo (0.95): fee mínima en extremos, ev_net > 0."""
+        calc = EVCalculator()
+        # fee_per_contract(0.95) = 0.95 * 0.05 * 0.07 ≈ 0.0033 — muy pequeña
+        result = calc.calculate(
+            my_prob=0.97,
+            contract_price=0.95,
+            contracts=5,
+            bankroll=100.0,
+        )
+
+        assert result.ev_net > 0.0

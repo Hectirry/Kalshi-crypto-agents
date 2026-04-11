@@ -38,6 +38,34 @@ def sample_price(make_price_snapshot):
     return make_price_snapshot()
 
 
+@pytest.fixture
+def sample_agent_context():
+    from engine.context_builder import AgentContext, OutcomeStats
+
+    empty = OutcomeStats(
+        sample_size=0,
+        wins=0,
+        losses=0,
+        win_rate=0.0,
+        avg_delta=0.0,
+        avg_ev_net=0.0,
+    )
+    return AgentContext(
+        category="BTC",
+        time_zone="MID",
+        overall=empty,
+        same_category=empty,
+        same_time_zone=empty,
+        same_ticker=empty,
+        same_direction=empty,
+        same_setup=empty,
+        recent_same_ticker=[],
+        recent_same_category=[],
+        recent_same_setup=[],
+        live_features=None,
+    )
+
+
 # ── 1. main en --dry-run arranca sin errores ──────────────────────────────────
 
 class TestDryRunStartup:
@@ -66,9 +94,19 @@ class TestDryRunStartup:
 
         # Verificar que la DB arranca sin señales (recalibrate hace skip)
         from main import _maybe_recalibrate
-        _maybe_recalibrate(db, bankroll=100.0)   # no lanza excepciones
+        _maybe_recalibrate(cfg, db, bankroll=100.0)   # no lanza excepciones
 
         db.close()
+
+    def test_production_paper_trade_still_uses_demo_executor(self, app_config) -> None:
+        from dataclasses import replace
+
+        from main import _resolve_execution_mode
+
+        prod_cfg = replace(app_config, env="production")
+
+        assert _resolve_execution_mode(cfg=prod_cfg, paper_trade=True) == "demo"
+        assert _resolve_execution_mode(cfg=prod_cfg, paper_trade=False) == "production"
 
     @pytest.mark.asyncio
     async def test_orchestrator_cancels_cleanly(self, tmp_path: Path) -> None:
@@ -137,12 +175,103 @@ class TestDryRunStartup:
 class TestOpenRouterAgent:
     """Tests del agente LLM vía OpenRouter."""
 
+    def test_build_prompt_includes_live_features(self, sample_signal, sample_market, sample_price):
+        from engine.context_builder import AgentContext, LiveSignalFeatures, OutcomeStats
+        from engine.openrouter_agent import OpenRouterAgent
+        from intelligence.social_sentiment import SocialSentimentSnapshot
+
+        empty = OutcomeStats(
+            sample_size=0,
+            wins=0,
+            losses=0,
+            win_rate=0.0,
+            avg_delta=0.0,
+            avg_ev_net=0.0,
+        )
+        context = AgentContext(
+            category="BTC",
+            time_zone="MID",
+            overall=empty,
+            same_category=empty,
+            same_time_zone=empty,
+            same_ticker=empty,
+            same_direction=empty,
+            same_setup=empty,
+            recent_same_ticker=[],
+            recent_same_category=[],
+            recent_same_setup=[],
+            live_features=LiveSignalFeatures(
+                contract_side="YES",
+                contract_price=0.56,
+                spot_price=95_000.0,
+                strike=95_100.0,
+                distance_to_strike_pct=-0.001,
+                strike_distance_sigmas=-0.35,
+                realized_vol_1m=0.0042,
+                momentum_15s_pct=0.001,
+                momentum_60s_pct=0.002,
+                rsi_14=62.0,
+                bid_ask_spread_bps=3.2,
+                open_interest_proxy=1234.0,
+                market_skew=0.04,
+                trend_alignment="aligned",
+                regime_label="uptrend|calm|tight_spread",
+            ),
+            social_sentiment=SocialSentimentSnapshot(
+                symbol="BTC",
+                source="reddit",
+                sentiment_score=0.22,
+                mention_count=12,
+                bullish_ratio=0.58,
+                bearish_ratio=0.17,
+                acceleration=0.4,
+                confidence=0.74,
+                age_seconds=80,
+                updated_at=time.time() - 80,
+            ),
+        )
+        agent = OpenRouterAgent(api_key="test-key")
+
+        messages = agent._build_prompt(
+            signal=sample_signal,
+            market=sample_market,
+            price=sample_price,
+            context=context,
+        )
+
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        assert "realized_vol_1m" in messages[1]["content"]
+        assert "trend_alignment=aligned" in messages[1]["content"]
+        assert "sentiment_score=0.220" in messages[1]["content"]
+        assert "same setup" not in messages[1]["content"].lower()
+
+    def test_build_prompt_explicitly_marks_missing_social_context(
+        self,
+        sample_signal,
+        sample_market,
+        sample_price,
+        sample_agent_context,
+    ):
+        from engine.openrouter_agent import OpenRouterAgent
+
+        agent = OpenRouterAgent(api_key="test-key")
+        messages = agent._build_prompt(
+            signal=sample_signal,
+            market=sample_market,
+            price=sample_price,
+            context=sample_agent_context,
+        )
+
+        assert "no disponible o desactivado" in messages[1]["content"]
+
     @pytest.mark.asyncio
     async def test_consult_returns_valid_verdict(
         self,
         sample_signal,
         sample_market,
         sample_price,
+        sample_agent_context,
     ) -> None:
         """Mock HTTP responde con JSON válido → AgentVerdict bien formado."""
         from engine.openrouter_agent import AgentVerdict, OpenRouterAgent
@@ -172,7 +301,7 @@ class TestOpenRouterAgent:
                 signal=sample_signal,
                 market=sample_market,
                 price=sample_price,
-                recent_signals=[],
+                context=sample_agent_context,
             )
 
         assert isinstance(verdict, AgentVerdict)
@@ -187,6 +316,7 @@ class TestOpenRouterAgent:
         sample_signal,
         sample_market,
         sample_price,
+        sample_agent_context,
     ) -> None:
         """El agente no puede aumentar el kelly — solo reducir o mantener."""
         from engine.openrouter_agent import OpenRouterAgent
@@ -219,7 +349,7 @@ class TestOpenRouterAgent:
                 signal=sample_signal,
                 market=sample_market,
                 price=sample_price,
-                recent_signals=[],
+                context=sample_agent_context,
             )
 
         assert verdict.adjusted_kelly <= original_kelly
@@ -388,6 +518,7 @@ class TestAgentTimeout:
         sample_signal,
         sample_market,
         sample_price,
+        sample_agent_context,
     ) -> None:
         """
         Un mock que tarda 4s provoca TimeoutError en el agente.
@@ -409,7 +540,7 @@ class TestAgentTimeout:
                 signal=sample_signal,
                 market=sample_market,
                 price=sample_price,
-                recent_signals=[],
+                context=sample_agent_context,
             )
 
         assert verdict.proceed is True
@@ -423,6 +554,7 @@ class TestAgentTimeout:
         sample_signal,
         sample_market,
         sample_price,
+        sample_agent_context,
     ) -> None:
         """Variante: el mock de aiohttp es lento — verifica el timeout end-to-end."""
         from engine.openrouter_agent import AGENT_TIMEOUT_S, OpenRouterAgent
@@ -441,7 +573,7 @@ class TestAgentTimeout:
                 signal=sample_signal,
                 market=sample_market,
                 price=sample_price,
-                recent_signals=[],
+                context=sample_agent_context,
             )
             elapsed = time.monotonic() - start
 

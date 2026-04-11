@@ -5,12 +5,6 @@ Modos:
   python main.py                    # loop de trading usando ENV del .env
   python main.py --dry-run          # fuerza demo aunque ENV=production
   python main.py --backtest-only    # solo recalibra y sale
-
-Retrocompatibilidad con scripts:
-  python main.py --mode smoke       # E2E smoke test
-  python main.py --mode loop        # loop de smoke tests
-  python main.py --mode trading     # trading demo vía script
-  python main.py --mode dashboard   # dashboard terminal
 """
 
 from __future__ import annotations
@@ -21,34 +15,43 @@ import logging
 import os
 import signal
 import time
+from pathlib import Path
 
 import uvicorn
 
 from backtesting.backtest_runner import BacktestRunner
 from backtesting.category_blocker import CategoryBlocker
+from backtesting.outcome_resolver import OutcomeResolver
 from backtesting.param_injector import ParamInjector
 from core.config import AppConfig, load_config
 from core.database import Database
 from core.interfaces import EventBus
 from core.models import PriceSnapshot
 from engine.ev_calculator import EVCalculator
+from engine.price_resolver import resolve_reference_price
 from engine.probability import ProbabilityEngine, classify_time_zone
 from engine.signal_router import SignalRouter
 from engine.timing import TimingFilter
 from execution.order_executor import PaperOrderExecutor
 from execution.position_manager import PositionManager
 from feeds.binance_feed import BinancePriceFeed
+from feeds.hyperliquid_feed import HyperliquidFeed
 from feeds.kalshi_feed import KalshiFeed
+from intelligence.reddit_provider import RedditSocialSentimentProvider
+from intelligence.social_sentiment import SocialSentimentService
+from memory.openclaw_adapter import OpenClawMemoryAdapter
 
 logger = logging.getLogger(__name__)
 
 # ── Constantes operativas ──────────────────────────────────────────────────────
-BANKROLL_DEFAULT: float = 100.0
+BANKROLL_DEFAULT: float = 1000.0
 SIGNALS_LOOKBACK_S: float = 48 * 3600   # 48h para backtest pre-arranque
 SUPERVISOR_INTERVAL_S: int = 60          # cada 60s evalúa SL/TP
 RECALIBRATE_INTERVAL_S: int = 86400      # cada 24h recalibra
 EXPIRY_CLOSE_S: int = 120                # cierra posición si quedan ≤ 120s
 REST_POLL_INTERVAL_S: int = 90           # polling REST de mercados Kalshi
+OUTCOME_RESOLVE_INTERVAL_S: int = 300    # resolución de outcomes cada 5 min
+OUTCOME_CALIBRATE_THRESHOLD: int = 20    # recalibrar si ≥ 20 outcomes nuevos
 DASHBOARD_PORT: int = 8090
 
 
@@ -85,34 +88,15 @@ def parse_args() -> argparse.Namespace:
         "--bankroll",
         type=float,
         default=None,
-        help="Capital USD (default: env BANKROLL_USD o 100.0)",
+        help="Capital USD (default: env BANKROLL_USD o 1000.0)",
     )
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=3,
+        default=5,
         help="Máximo de posiciones abiertas simultáneamente",
     )
 
-    # Retrocompatibilidad
-    parser.add_argument(
-        "--mode",
-        choices=("smoke", "loop", "dashboard", "trading"),
-        default=None,
-        help="Modo legacy (retrocompatibilidad con scripts/)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=30,
-        help="Intervalo en segundos para --mode loop",
-    )
-    parser.add_argument(
-        "--refresh",
-        type=int,
-        default=5,
-        help="Refresh en segundos para --mode dashboard",
-    )
     return parser.parse_args()
 
 
@@ -138,7 +122,7 @@ def _resolve_bankroll(args_bankroll: float | None) -> float:
     return BANKROLL_DEFAULT
 
 
-def _maybe_recalibrate(db: Database, bankroll: float) -> None:
+def _maybe_recalibrate(cfg: AppConfig, db: Database, bankroll: float) -> None:
     """
     Recalibra parámetros y categorías si hay señales en las últimas 48h.
 
@@ -155,7 +139,7 @@ def _maybe_recalibrate(db: Database, bankroll: float) -> None:
         logger.info("recalibrate_start signals_in_48h=True")
         from_ts = now - SIGNALS_LOOKBACK_S
 
-        runner = BacktestRunner(db=db, initial_bankroll=bankroll)
+        runner = BacktestRunner(db=db, initial_bankroll=bankroll, config=cfg.engine)
         result = runner.run(from_ts=from_ts, to_ts=now)
         logger.info(
             "backtest_complete win_rate=%.3f signals=%d pnl=%.4f",
@@ -177,7 +161,30 @@ def _maybe_recalibrate(db: Database, bankroll: float) -> None:
         logger.warning("recalibrate_error exc=%s — continuando arranque", exc)
 
 
-def _build_router(cfg: AppConfig, db: Database) -> SignalRouter:
+def _build_social_sentiment_service(cfg: AppConfig) -> SocialSentimentService | None:
+    """Construye el servicio opcional de sentimiento social cacheado."""
+    if not cfg.social_sentiment.enabled:
+        logger.info("social_sentiment disabled")
+        return None
+
+    provider_name = cfg.social_sentiment.provider
+    if provider_name != "reddit":
+        logger.warning("social_sentiment provider=%s not supported", provider_name)
+        return None
+
+    service = SocialSentimentService(
+        config=cfg.social_sentiment,
+        provider=RedditSocialSentimentProvider(config=cfg.social_sentiment),
+    )
+    logger.info("social_sentiment enabled provider=%s", provider_name)
+    return service
+
+
+def _build_router(
+    cfg: AppConfig,
+    db: Database,
+    social_sentiment_service: SocialSentimentService | None = None,
+) -> SignalRouter:
     """Construye el SignalRouter, con OpenRouter si la key está disponible."""
     openrouter_agent = None
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -196,7 +203,27 @@ def _build_router(cfg: AppConfig, db: Database) -> SignalRouter:
         db=db,
         blocked_categories=set(db.get_blocked_categories()),
         openrouter_agent=openrouter_agent,
+        social_sentiment_service=social_sentiment_service,
     )
+
+
+def _build_memory_adapter() -> OpenClawMemoryAdapter | None:
+    """Construye un adapter opcional hacia el workspace de OpenClaw."""
+
+    workspace = os.getenv("OPENCLAW_WORKSPACE", "").strip()
+    if not workspace:
+        logger.info("openclaw_memory disabled (OPENCLAW_WORKSPACE not set)")
+        return None
+    adapter = OpenClawMemoryAdapter(workspace=Path(workspace).expanduser())
+    adapter.initialize()
+    logger.info("openclaw_memory enabled workspace=%s", adapter.workspace)
+    return adapter
+
+
+def _resolve_execution_mode(cfg: AppConfig, paper_trade: bool) -> str:
+    """Resuelve el modo efectivo del executor."""
+
+    return "demo" if (paper_trade or cfg.is_demo) else "production"
 
 
 # ── Dashboard en background ────────────────────────────────────────────────────
@@ -204,11 +231,12 @@ def _build_router(cfg: AppConfig, db: Database) -> SignalRouter:
 async def _serve_dashboard(
     db: Database,
     cfg: AppConfig,
+    runtime_mode: str,
     port: int = DASHBOARD_PORT,
 ) -> None:
     """Arranca el servidor FastAPI en background como tarea asyncio."""
     from dashboard.api_server import create_app
-    app = create_app(db=db, config=cfg)
+    app = create_app(db=db, config=cfg, runtime_mode=runtime_mode)
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
@@ -246,23 +274,34 @@ async def _run_orchestrator(
                      órdenes reales a Kalshi (paper trading). Si False y
                      cfg.is_production, se requiere un cliente real de Kalshi.
     """
-    router = _build_router(cfg, db)
+    social_sentiment_service = _build_social_sentiment_service(cfg)
+    router = _build_router(cfg, db, social_sentiment_service=social_sentiment_service)
 
     # Determinar modo de ejecución:
     # - paper_trade=True  → siempre demo executor (sin órdenes reales)
     # - paper_trade=False y production → production executor (requiere client real)
     # - demo env → siempre paper
-    exec_mode = "demo" if (paper_trade or cfg.is_demo) else "production"
+    exec_mode = _resolve_execution_mode(cfg=cfg, paper_trade=paper_trade)
     executor = PaperOrderExecutor(db=db, mode=exec_mode)
     logger.info("executor_mode=%s api_env=%s", exec_mode, cfg.env)
-    pos_mgr = PositionManager(db=db, executor=executor)
-    pos_mgr.sync_open_trades()
+    pos_mgr = PositionManager(
+        db=db,
+        executor=executor,
+        initial_bankroll=bankroll,
+        min_closed_trades=5,
+        min_win_rate=0.35,
+        min_total_pnl=-(bankroll * 0.15),
+        max_drawdown_pct=0.50,
+    )
+    await pos_mgr.hydrate_from_db()
 
     bus = EventBus()
     bfeed = BinancePriceFeed(cfg.binance, bus)
+    hfeed = HyperliquidFeed(cfg.hyperliquid, bus)
     kfeed = KalshiFeed(cfg, bus)
+    memory_adapter = _build_memory_adapter()
 
-    latest_prices: dict[str, PriceSnapshot] = {}
+    latest_prices: dict[str, dict[str, PriceSnapshot]] = {}
 
     shutdown_event = asyncio.Event()
 
@@ -281,18 +320,32 @@ async def _run_orchestrator(
     )
 
     await bfeed.connect()
+    await hfeed.connect()
     await kfeed.connect()
+
+    resolver = OutcomeResolver(db=db, kalshi_client=kfeed)
+    if social_sentiment_service is not None:
+        await social_sentiment_service.start()
+    if memory_adapter is not None:
+        snap = pos_mgr.observability_snapshot()
+        memory_adapter.record_session_start(
+            mode=exec_mode,
+            bankroll=bankroll,
+            total_pnl=float(snap["total_pnl"]),
+            go_allowed=pos_mgr.go_no_go_status().allowed,
+        )
 
     tasks: list[asyncio.Task] = []
     try:
         tasks = [
-            asyncio.create_task(_price_task(bfeed, latest_prices), name="price"),
+            asyncio.create_task(_price_task(bfeed, latest_prices), name="price_binance"),
+            asyncio.create_task(_price_task(hfeed, latest_prices), name="price_hyperliquid"),
             asyncio.create_task(
-                _market_task(kfeed, router, pos_mgr, latest_prices, bankroll, max_positions),
+                _market_task(kfeed, router, pos_mgr, latest_prices, bankroll, max_positions, memory_adapter),
                 name="market",
             ),
             asyncio.create_task(
-                _rest_poll_task(kfeed, router, pos_mgr, latest_prices, bankroll, max_positions),
+                _rest_poll_task(kfeed, router, pos_mgr, latest_prices, bankroll, max_positions, memory_adapter),
                 name="rest_poll",
             ),
             asyncio.create_task(
@@ -304,7 +357,11 @@ async def _run_orchestrator(
                 name="recal",
             ),
             asyncio.create_task(
-                _serve_dashboard(db, cfg=cfg, port=DASHBOARD_PORT),
+                _outcome_task(resolver, db, router, bankroll),
+                name="outcome_resolver",
+            ),
+            asyncio.create_task(
+                _serve_dashboard(db, cfg=cfg, runtime_mode=exec_mode, port=DASHBOARD_PORT),
                 name="dashboard",
             ),
         ]
@@ -317,11 +374,13 @@ async def _run_orchestrator(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        for feed in (bfeed, kfeed):
+        for feed in (bfeed, hfeed, kfeed):
             try:
                 await feed.disconnect()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("feed_disconnect_error: %s", exc)
+        if social_sentiment_service is not None:
+            await social_sentiment_service.stop()
 
         snap = pos_mgr.observability_snapshot()
         logger.info(
@@ -339,52 +398,63 @@ async def _run_orchestrator(
 # ── Tasks internas ─────────────────────────────────────────────────────────────
 
 async def _price_task(
-    bfeed: BinancePriceFeed,
-    latest_prices: dict[str, PriceSnapshot],
+    price_feed,
+    latest_prices: dict[str, dict[str, PriceSnapshot]],
 ) -> None:
     """Actualiza la caché de precios spot continuamente."""
-    async for snap in bfeed.stream():
-        latest_prices[snap.symbol] = snap
+    async for snap in price_feed.stream():
+        latest_prices.setdefault(snap.symbol, {})[snap.source] = snap
 
 
 async def _market_task(
     kfeed: KalshiFeed,
     router: SignalRouter,
     pos_mgr: PositionManager,
-    latest_prices: dict[str, PriceSnapshot],
+    latest_prices: dict[str, dict[str, PriceSnapshot]],
     bankroll: float,
     max_positions: int,
+    memory_adapter: OpenClawMemoryAdapter | None = None,
 ) -> None:
     """Procesa cada MarketSnapshot del stream WS de Kalshi."""
     async for market in kfeed.stream_markets():
-        await _process_market(market, router, pos_mgr, latest_prices, bankroll, max_positions)
+        await _process_market(
+            market,
+            router,
+            pos_mgr,
+            latest_prices,
+            bankroll,
+            max_positions,
+            memory_adapter,
+        )
 
 
 async def _process_market(
     market,
     router: SignalRouter,
     pos_mgr: PositionManager,
-    latest_prices: dict,
+    latest_prices: dict[str, dict[str, PriceSnapshot]],
     bankroll: float,
     max_positions: int,
+    memory_adapter: OpenClawMemoryAdapter | None = None,
 ) -> None:
     """Lógica compartida de evaluación para un MarketSnapshot (WS o REST)."""
     ticker = market.ticker
 
     if market.time_to_expiry_s <= EXPIRY_CLOSE_S:
-        for trade_id, trade in list(pos_mgr.open_positions.items()):
+        for _trade_id, trade in list(pos_mgr.open_positions.items()):
             if trade.ticker == ticker:
                 exit_price = (
                     market.implied_prob
                     if trade.side == "YES"
                     else max(0.01, min(0.99, 1.0 - market.implied_prob))
                 )
-                await pos_mgr.executor.close_with_price(trade, exit_price)
-                del pos_mgr.open_positions[trade_id]
+                managed_close = await pos_mgr.close_trade(trade, exit_price, "expiry")
                 logger.info(
                     "expiry_close ticker=%s side=%s exit=%.4f",
                     ticker, trade.side, exit_price,
                 )
+                if memory_adapter is not None:
+                    memory_adapter.record_trade_close(trade=managed_close.trade, reason="expiry")
         return
 
     closes = await pos_mgr.evaluate_price(
@@ -396,17 +466,39 @@ async def _process_market(
             "position_closed ticker=%s pnl=%.4f reason=%s",
             ticker, mc.trade.pnl or 0.0, mc.reason,
         )
+        if memory_adapter is not None:
+            memory_adapter.record_trade_close(trade=mc.trade, reason=mc.reason)
 
-    if pos_mgr.has_open_ticker(ticker) or len(pos_mgr.open_positions) >= max_positions:
+    if pos_mgr.has_traded_ticker(ticker) or len(pos_mgr.open_positions) >= max_positions:
         return
 
-    price = latest_prices.get(market.category)
-    if price is None:
+    resolution = resolve_reference_price(
+        symbol=market.category,
+        latest_prices=latest_prices,
+        now_ts=market.timestamp,
+    )
+    if resolution.snapshot is None:
+        if resolution.blocked_reason is not None:
+            logger.info(
+                "price_resolution_blocked ticker=%s reason=%s spread_pct=%s",
+                ticker,
+                resolution.blocked_reason,
+                f"{resolution.spread_pct:.6f}" if resolution.spread_pct is not None else "n/a",
+            )
+        return
+    price = resolution.snapshot
+    if resolution.blocked_reason is not None:
         return
 
     signal = await router.evaluate_async(market=market, price=price, bankroll=bankroll)
 
     if signal.is_actionable:
+        status = pos_mgr.go_no_go_status(max_open_positions=max_positions, category=market.category)
+        if not status.allowed:
+            logger.info("TRADE_BLOCKED go=%s reason=%s ticker=%s", status.allowed, status.reason, ticker)
+            if memory_adapter is not None:
+                memory_adapter.record_trade_blocked(ticker=ticker, reason=status.reason)
+            return
         trade = await pos_mgr.try_open_from_signal(signal, max_positions=max_positions)
         if trade is None:
             return
@@ -416,6 +508,8 @@ async def _process_market(
             trade.ticker, trade.side, trade.contracts, trade.entry_price,
             signal.delta, zone,
         )
+        if memory_adapter is not None:
+            memory_adapter.record_trade_open(trade, signal, price.source)
     else:
         logger.debug(
             "signal_skip ticker=%s decision=%s reason=%s",
@@ -427,9 +521,10 @@ async def _rest_poll_task(
     kfeed: KalshiFeed,
     router: SignalRouter,
     pos_mgr: PositionManager,
-    latest_prices: dict,
+    latest_prices: dict[str, dict[str, PriceSnapshot]],
     bankroll: float,
     max_positions: int,
+    memory_adapter: OpenClawMemoryAdapter | None = None,
 ) -> None:
     """Polling REST periódico para no depender exclusivamente del WS."""
     await asyncio.sleep(5)   # espera inicial para que los precios estén disponibles
@@ -438,7 +533,15 @@ async def _rest_poll_task(
             markets = await kfeed.get_active_markets()
             logger.info("rest_poll markets=%d", len(markets))
             for market in markets:
-                await _process_market(market, router, pos_mgr, latest_prices, bankroll, max_positions)
+                await _process_market(
+                    market,
+                    router,
+                    pos_mgr,
+                    latest_prices,
+                    bankroll,
+                    max_positions,
+                    memory_adapter,
+                )
         except (ConnectionError, RuntimeError, TimeoutError, ValueError) as exc:
             logger.warning("rest_poll_error: %s", exc)
         await asyncio.sleep(REST_POLL_INTERVAL_S)
@@ -466,10 +569,38 @@ async def _recal_task(db: Database, router: SignalRouter, bankroll: float) -> No
     while True:
         await asyncio.sleep(RECALIBRATE_INTERVAL_S)
         logger.info("recal_task_start")
-        _maybe_recalibrate(db, bankroll)
+        _maybe_recalibrate(cfg, db, bankroll)
         # Recargar categorías bloqueadas en el router
         router.blocked_categories = set(db.get_blocked_categories())
         logger.info("recal_task_done blocked=%s", router.blocked_categories)
+
+
+async def _outcome_task(
+    resolver: OutcomeResolver,
+    db: Database,
+    router: SignalRouter,
+    bankroll: float,
+) -> None:
+    """Resuelve outcomes de señales expiradas cada 5 minutos."""
+    accumulated_new = 0
+    logger.info("outcome_resolver initialized")
+    while True:
+        await asyncio.sleep(OUTCOME_RESOLVE_INTERVAL_S)
+        try:
+            n = await resolver.resolve_expired()
+            logger.info("outcome_resolver: resolved %d outcomes this cycle", n)
+            if n > 0:
+                accumulated_new += n
+                if accumulated_new >= OUTCOME_CALIBRATE_THRESHOLD:
+                    accumulated_new = 0
+                    logger.info(
+                        "outcome_resolver: triggering recalibration (%d new outcomes)",
+                        n,
+                    )
+                    _maybe_recalibrate(cfg, db, bankroll)
+                    router.blocked_categories = set(db.get_blocked_categories())
+        except (ConnectionError, RuntimeError) as exc:
+            logger.warning("outcome_resolver: error en ciclo: %s", exc)
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
@@ -477,43 +608,6 @@ async def _recal_task(db: Database, router: SignalRouter, bankroll: float) -> No
 def main() -> None:
     """Punto de entrada principal."""
     args = parse_args()
-
-    # ── Retrocompatibilidad con --mode ────────────────────────────────────────
-    if args.mode is not None:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        )
-        if args.mode == "smoke":
-            from scripts.e2e_smoke import run_e2e
-            asyncio.run(run_e2e())
-            return
-        if args.mode == "loop":
-            from scripts.e2e_smoke import run_e2e
-
-            async def _loop() -> None:
-                while True:
-                    try:
-                        await run_e2e()
-                    except (ConnectionError, RuntimeError, TimeoutError, ValueError) as exc:
-                        logger.warning("E2E_LOOP_ERROR: %s", exc)
-                    await asyncio.sleep(max(2, args.interval))
-
-            asyncio.run(_loop())
-            return
-        if args.mode == "trading":
-            from scripts.trading_loop import run_trading_demo
-            bankroll = _resolve_bankroll(args.bankroll)
-            asyncio.run(run_trading_demo(
-                config_path=args.config,
-                bankroll=bankroll,
-                max_positions=args.max_positions,
-            ))
-            return
-        if args.mode == "dashboard":
-            from scripts.terminal_dashboard import run_dashboard
-            asyncio.run(run_dashboard(config_path=args.config, refresh_s=args.refresh))
-            return
 
     # ── Orquestador principal ─────────────────────────────────────────────────
     # --dry-run = demo completo (API demo + paper).
@@ -546,7 +640,7 @@ def main() -> None:
     )
 
     # Pre-arranque: recalibrar si hay señales recientes
-    _maybe_recalibrate(db, bankroll)
+    _maybe_recalibrate(cfg, db, bankroll)
 
     if args.backtest_only:
         logger.info("backtest_only mode — exiting after recalibration")

@@ -32,7 +32,7 @@ from core.models import (
 logger = logging.getLogger(__name__)
 
 # Versión actual del schema → incrementar al agregar migraciones
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -104,8 +104,8 @@ class Database:
                 INSERT INTO signals
                     (ticker, decision, my_prob, market_prob, delta,
                      ev_net_fees, kelly_size, confidence, time_remaining_s,
-                     reasoning, created_at, outcome, outcome_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     reasoning, created_at, outcome, outcome_at, contract_price, market_overround_bps)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal.market_ticker,
@@ -121,6 +121,8 @@ class Database:
                     signal.timestamp,
                     signal.outcome.value if signal.outcome else None,
                     signal.outcome_at,
+                    signal.contract_price,
+                    signal.market_overround_bps,
                 ),
             )
             return cur.lastrowid  # type: ignore[return-value]
@@ -251,6 +253,91 @@ class Database:
             if cur.rowcount == 0:
                 raise ValueError(f"Trade ID {trade_id} no encontrado")
 
+    def get_pending_outcome_signals(
+        self,
+        cutoff_ts: float,
+        limit: int = 50,
+    ) -> list[tuple[int, str, str]]:
+        """
+        Retorna señales que necesitan resolución de outcome.
+
+        Criterios: outcome IS NULL AND created_at < cutoff_ts AND decision IN ('YES', 'NO').
+
+        Args:
+            cutoff_ts: solo señales creadas antes de este timestamp (unix).
+            limit:     máximo de registros a retornar por ciclo.
+
+        Returns:
+            Lista de (signal_id, ticker, decision) ordenada por created_at ASC.
+        """
+        self._assert_connected()
+        rows = self._conn.execute(  # type: ignore[union-attr]
+            """
+            SELECT id, ticker, decision
+            FROM signals
+            WHERE outcome IS NULL
+              AND created_at < ?
+              AND decision IN ('YES', 'NO')
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (cutoff_ts, limit),
+        ).fetchall()
+        return [(int(row["id"]), row["ticker"], row["decision"]) for row in rows]
+
+    def get_open_trade_by_signal(self, signal_id: int) -> Trade | None:
+        """Retorna el trade abierto asociado a un signal_id, o None si no existe."""
+        self._assert_connected()
+        row = self._conn.execute(  # type: ignore[union-attr]
+            """
+            SELECT * FROM trades
+            WHERE signal_id = ?
+              AND status = ?
+            LIMIT 1
+            """,
+            (signal_id, TradeStatus.OPEN.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_trade(row)
+
+    def get_trade_by_id(self, trade_id: int) -> Trade | None:
+        """Retorna un trade por id sin importar su status."""
+
+        self._assert_connected()
+        row = self._conn.execute(  # type: ignore[union-attr]
+            """
+            SELECT * FROM trades
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_trade(row)
+
+    def has_trade_for_ticker(self, ticker: str, mode: TradeMode | None = None) -> bool:
+        """Retorna True si ya existe un trade persistido para el ticker."""
+
+        self._assert_connected()
+        params: list = [ticker]
+        mode_clause = ""
+        if mode is not None:
+            mode_clause = " AND mode = ?"
+            params.append(mode.value)
+        row = self._conn.execute(  # type: ignore[union-attr]
+            f"""
+            SELECT 1
+            FROM trades
+            WHERE ticker = ?
+              {mode_clause}
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return row is not None
+
     def get_open_trades(self, mode: TradeMode | None = None) -> list[Trade]:
         """Retorna todos los trades con status='open'."""
         self._assert_connected()
@@ -261,6 +348,126 @@ class Database:
             params.append(mode.value)
         rows = self._conn.execute(query, params).fetchall()  # type: ignore[union-attr]
         return [_row_to_trade(row) for row in rows]
+
+    def get_closed_trades(
+        self,
+        limit: int = 200,
+        mode: TradeMode | None = None,
+    ) -> list[Trade]:
+        """Retorna trades cerrados recientes, más nuevos primero."""
+        self._assert_connected()
+        safe_limit = max(1, limit)
+        query = "SELECT * FROM trades WHERE status = ?"
+        params: list = [TradeStatus.CLOSED.value]
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode.value)
+        query += " ORDER BY COALESCE(closed_at, opened_at) DESC, id DESC LIMIT ?"
+        params.append(safe_limit)
+        rows = self._conn.execute(query, params).fetchall()  # type: ignore[union-attr]
+        return [_row_to_trade(row) for row in rows]
+
+    def get_trade_pnl_summary(self, mode: TradeMode | None = None) -> dict[str, float | int]:
+        """Agrega PnL realizado y conteos de trades por estado."""
+        self._assert_connected()
+        params: list = []
+        mode_clause = ""
+        if mode is not None:
+            mode_clause = " AND mode = ?"
+            params.append(mode.value)
+        row = self._conn.execute(  # type: ignore[union-attr]
+            f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN status = '{TradeStatus.CLOSED.value}' THEN pnl ELSE 0 END), 0.0) AS realized_pnl,
+                COALESCE(SUM(CASE WHEN status = '{TradeStatus.CLOSED.value}' THEN fee_paid ELSE 0 END), 0.0) AS closed_fees,
+                COALESCE(SUM(CASE WHEN status = '{TradeStatus.OPEN.value}' THEN fee_paid ELSE 0 END), 0.0) AS open_fees,
+                COALESCE(SUM(CASE WHEN status = '{TradeStatus.CLOSED.value}' THEN 1 ELSE 0 END), 0) AS closed_trades,
+                COALESCE(SUM(CASE WHEN status = '{TradeStatus.OPEN.value}' THEN 1 ELSE 0 END), 0) AS open_trades
+            FROM trades
+            WHERE 1 = 1{mode_clause}
+            """,
+            params,
+        ).fetchone()
+        return {
+            "realized_pnl": float(row["realized_pnl"]),
+            "closed_fees": float(row["closed_fees"]),
+            "open_fees": float(row["open_fees"]),
+            "closed_trades": int(row["closed_trades"]),
+            "open_trades": int(row["open_trades"]),
+        }
+
+    def get_realized_pnl_between(
+        self,
+        start_ts: float,
+        end_ts: float,
+        mode: TradeMode | None = None,
+    ) -> float:
+        """Retorna PnL realizado para trades cerrados dentro de un rango temporal."""
+        self._assert_connected()
+        params: list = [TradeStatus.CLOSED.value, start_ts, end_ts]
+        mode_clause = ""
+        if mode is not None:
+            mode_clause = " AND mode = ?"
+            params.append(mode.value)
+        row = self._conn.execute(  # type: ignore[union-attr]
+            f"""
+            SELECT COALESCE(SUM(pnl), 0.0) AS realized_pnl
+            FROM trades
+            WHERE status = ?
+              AND closed_at >= ?
+              AND closed_at < ?
+              {mode_clause}
+            """,
+            params,
+        ).fetchone()
+        return float(row["realized_pnl"])
+
+    # ─── Analytics de calidad de ejecución ───────────────────────────────────
+
+    def fetch_resolved_signals_with_trades(self, limit: int = 500) -> list[dict]:
+        """
+        Retorna señales accionables resueltas (outcome IS NOT NULL) con su trade
+        cerrado asociado.
+
+        Solo incluye señales con decision YES/NO que tienen un trade cerrado
+        vinculado vía signal_id. Útil para analytics de calidad de ejecución.
+
+        Args:
+            limit: máximo de registros, los más recientes primero.
+
+        Returns:
+            Lista de dicts con campos de signals + trades (pnl, contracts, etc.).
+            Vacía si no hay datos.
+        """
+        self._assert_connected()
+        rows = self._conn.execute(  # type: ignore[union-attr]
+            """
+            SELECT
+                s.id                  AS signal_id,
+                s.ticker,
+                s.delta,
+                s.ev_net_fees,
+                s.contract_price,
+                s.market_overround_bps,
+                s.my_prob,
+                s.market_prob,
+                s.outcome,
+                s.created_at,
+                t.pnl,
+                t.contracts,
+                t.entry_price,
+                t.side
+            FROM signals s
+            INNER JOIN trades t ON t.signal_id = s.id
+            WHERE s.outcome IS NOT NULL
+              AND s.decision IN ('YES', 'NO')
+              AND t.status = 'closed'
+            ORDER BY s.created_at DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # ─── Parámetros del backtesting ───────────────────────────────────────────
 
@@ -382,10 +589,13 @@ class Database:
             )
             logger.info("Migración v1 aplicada")
 
-        # Template para futuras migraciones:
-        # if current < 2:
-        #     self._migration_v2(cur)
-        #     cur.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", (2, time.time()))
+        if current < 2:
+            self._migration_v2(cur)
+            cur.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (2, time.time()),
+            )
+            logger.info("Migración v2 aplicada")
 
     def _migration_v1(self, cur: sqlite3.Cursor) -> None:
         """Schema inicial → todas las tablas y sus índices."""
@@ -453,6 +663,11 @@ class Database:
             """
         )
 
+    def _migration_v2(self, cur: sqlite3.Cursor) -> None:
+        """Agrega precio efectivo del contrato y proxy de spread de mercado."""
+        cur.execute("ALTER TABLE signals ADD COLUMN contract_price REAL")
+        cur.execute("ALTER TABLE signals ADD COLUMN market_overround_bps REAL")
+
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
     @contextmanager
@@ -491,6 +706,10 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
         time_remaining_s   = row["time_remaining_s"],
         reasoning          = row["reasoning"] or "",
         timestamp          = row["created_at"],
+        contract_price     = row["contract_price"] if "contract_price" in row.keys() else None,
+        market_overround_bps = (
+            row["market_overround_bps"] if "market_overround_bps" in row.keys() else None
+        ),
         outcome            = Outcome(row["outcome"]) if row["outcome"] else None,
         outcome_at         = row["outcome_at"],
     )
