@@ -101,6 +101,34 @@ entrada por contrato.
 
 ---
 
+## 4b. Calibración de parámetros — correcciones de sesgo
+
+### Corrección de precio de entrada en `ParamInjector` (corregido)
+
+`_signal_realized_pnl` usaba `signal.market_probability` como precio de entrada
+en lugar de `signal.contract_price` (el precio ask real persistido desde v2).
+
+Efecto del bug original: calibración veía trades históricos como más rentables
+de lo que fueron (mid-price < ask real) → thresholds calibrados demasiado laxos
+→ más señales pasando filtros → peor PnL en live.
+
+Fix: nuevo método `_effective_contract_price(signal)` que espeja `BacktestRunner._contract_price()`:
+usa `signal.contract_price` si existe, cae a `market_probability` para señales pre-v2.
+
+### Muestra mínima para calibración (`min_calibration_samples`)
+
+`ParamInjector` ahora acepta `min_calibration_samples` (default=1, backward compatible).
+Candidatos de threshold con menos señales de lo requerido se descartan como si estuvieran vacíos.
+
+Uso recomendado en producción con histórico suficiente:
+```python
+ParamInjector(db=db, min_calibration_samples=5)
+```
+
+Previene sobreajuste a rachas cortas de suerte en muestras de 1-2 trades.
+
+---
+
 ## 4a. Analytics de calidad de ejecución
 
 Módulo nuevo: `analytics/execution_quality.py`
@@ -449,7 +477,7 @@ Si el bot vuelve a perder o el replay se ve raro, revisar en este orden:
 
 Última suite relevante ejecutada durante los ajustes recientes:
 
-- `214 passed, 5 skipped` (incluye 38 tests nuevos en `tests/test_analytics.py`)
+- `280 passed, 7 skipped` (incluye 38 tests en `tests/test_analytics.py` y 19 tests nuevos en `tests/test_backtesting.py`)
 
 Último replay alineado con política actual:
 

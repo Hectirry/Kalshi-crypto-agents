@@ -35,6 +35,7 @@ class ParamInjector:
         db: Database,
         delta_candidates: tuple[float, ...] = (0.05, 0.08, 0.10, 0.12, 0.15),
         ev_candidates: tuple[float, ...] = (0.04, 0.06, 0.10, 0.20),
+        min_calibration_samples: int = 1,
     ) -> None:
         """
         Inicializa el inyector de parámetros.
@@ -43,11 +44,17 @@ class ParamInjector:
             db: base de datos del proyecto.
             delta_candidates: candidatos de ``min_delta`` a evaluar.
             ev_candidates: candidatos de ``min_ev_threshold`` a evaluar.
+            min_calibration_samples: muestra mínima para considerar un candidato
+                válido. Candidatos con menos muestras se tratan como vacíos y no
+                se seleccionan. Con el default=1 se mantiene la conducta anterior.
+                Para producción se recomienda un valor de 5 o más para evitar
+                sobreajuste a rachas cortas de suerte.
         """
 
         self.db = db
         self.delta_candidates = delta_candidates
         self.ev_candidates = ev_candidates
+        self.min_calibration_samples = min_calibration_samples
         self.ev_calculator = EVCalculator()
 
     def calibrate(
@@ -170,13 +177,18 @@ class ParamInjector:
         candidates: tuple[float, ...],
         selector,
     ) -> tuple[float, float, int]:
-        """Elige el threshold con mejor score histórico."""
+        """
+        Elige el threshold con mejor score histórico.
+
+        Candidatos con menos de ``min_calibration_samples`` señales se tratan
+        como vacíos (avg_pnl = -inf) para evitar sobreajuste a muestras pequeñas.
+        """
 
         ranked: list[tuple[float, float, float, int]] = []
         for threshold in candidates:
             subset = [signal for signal in signals if selector(signal, threshold)]
             sample_size = len(subset)
-            if sample_size == 0:
+            if sample_size < max(1, self.min_calibration_samples):
                 ranked.append((threshold, float("-inf"), -1.0, 0))
                 continue
 
@@ -199,13 +211,33 @@ class ParamInjector:
             return False
         return signal.outcome == Outcome.WIN
 
-    def _signal_realized_pnl(self, signal: Signal) -> float:
-        """Estimacion de P&L realizado por contrato para ranking de thresholds."""
+    @staticmethod
+    def _effective_contract_price(signal: Signal) -> float:
+        """
+        Retorna el precio de entrada real de la señal para cálculo de PnL.
 
-        contract_price = signal.market_probability
+        Usa ``signal.contract_price`` (precio ask efectivo guardado desde v2)
+        cuando está disponible. Si no, cae al precio implícito del mercado como
+        aproximación compatible con señales antiguas.
+
+        Espejo de ``BacktestRunner._contract_price()`` para mantener coherencia
+        entre calibración y replay histórico.
+        """
+        if signal.contract_price is not None:
+            return max(0.01, min(signal.contract_price, 0.99))
         if signal.decision == Decision.NO:
-            contract_price = 1.0 - contract_price
-        contract_price = max(0.01, min(contract_price, 0.99))
+            return max(0.01, min(1.0 - signal.market_probability, 0.99))
+        return max(0.01, min(signal.market_probability, 0.99))
+
+    def _signal_realized_pnl(self, signal: Signal) -> float:
+        """
+        Estimación de P&L realizado por contrato para ranking de thresholds.
+
+        Usa el precio de entrada real (ask efectivo) en lugar del precio
+        implícito de mercado para que la calibración refleje el coste real de
+        cada entrada y no sobrestime la rentabilidad histórica.
+        """
+        contract_price = self._effective_contract_price(signal)
 
         won = self._signal_won(signal)
         exit_price = 1.0 if won else 0.0

@@ -606,6 +606,281 @@ class TestParamInjector:
 
         assert results == []
 
+    # ── _effective_contract_price correctness ──────────────────────────────────
+
+    def test_effective_contract_price_uses_stored_price_for_yes(self, make_signal):
+        """Cuando contract_price está guardado, debe usarse en lugar del mid."""
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.62,  # spread de 7 puntos sobre el mid
+        )
+        assert injector._effective_contract_price(signal) == pytest.approx(0.62)
+
+    def test_effective_contract_price_uses_stored_price_for_no(self, make_signal):
+        """NO side: usa contract_price (ya normalizado para NO) si está disponible."""
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.NO,
+            market_probability=0.60,
+            contract_price=0.43,  # no_ask guardado, no el complemento
+        )
+        assert injector._effective_contract_price(signal) == pytest.approx(0.43)
+
+    def test_effective_contract_price_fallback_yes_when_none(self, make_signal):
+        """Fallback a market_probability para YES cuando contract_price es None."""
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=None,
+        )
+        assert injector._effective_contract_price(signal) == pytest.approx(0.55)
+
+    def test_effective_contract_price_fallback_no_when_none(self, make_signal):
+        """Fallback a 1 - market_probability para NO cuando contract_price es None."""
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.NO,
+            market_probability=0.60,
+            contract_price=None,
+        )
+        # para NO side: precio efectivo = 1 - market_prob = 0.40
+        assert injector._effective_contract_price(signal) == pytest.approx(0.40)
+
+    # ── _signal_realized_pnl afectado por el spread ────────────────────────────
+
+    def test_realized_pnl_lower_when_entry_price_has_spread(self, make_signal):
+        """
+        Señal YES ganadora: PnL debe ser menor cuando contract_price > market_probability
+        (hay bid-ask spread), ya que entramos más caro que el mid.
+        """
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        # Sin spread: entry al mid
+        signal_mid = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=None,   # fallback a market_probability = 0.55
+            outcome=Outcome.WIN,
+        )
+        # Con spread: entry al ask, 7 puntos más caro
+        signal_ask = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.62,
+            outcome=Outcome.WIN,
+        )
+        pnl_mid = injector._signal_realized_pnl(signal_mid)
+        pnl_ask = injector._signal_realized_pnl(signal_ask)
+        # Pagar más en la entrada siempre reduce la ganancia neta
+        assert pnl_ask < pnl_mid
+
+    def test_realized_pnl_same_when_no_spread_stored(self, make_signal):
+        """
+        Con contract_price=None el PnL es idéntico al comportamiento anterior
+        (fallback a market_probability). Compatibilidad con señales pre-v2.
+        """
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=None,
+            outcome=Outcome.WIN,
+        )
+        pnl = injector._signal_realized_pnl(signal)
+        # gross = 1.0 - 0.55 = 0.45, entry_fee = fee(0.55), exit_fee = fee(1.0)=0
+        from engine.ev_calculator import EVCalculator
+        expected = (1.0 - 0.55) - EVCalculator().fee_per_contract(0.55)
+        assert pnl == pytest.approx(expected)
+
+    def test_realized_pnl_loss_reflects_actual_entry_cost(self, make_signal):
+        """LOSS: pérdida debe ser la totalidad del precio de entrada real."""
+        injector = ParamInjector(db=None)  # type: ignore[arg-type]
+        signal = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.60,
+            outcome=Outcome.LOSS,
+        )
+        pnl = injector._signal_realized_pnl(signal)
+        # gross = 0.0 - 0.60 = -0.60, entry_fee = fee(0.60), exit_fee = fee(0.0)=0
+        from engine.ev_calculator import EVCalculator
+        expected = -0.60 - EVCalculator().fee_per_contract(0.60)
+        assert pnl == pytest.approx(expected)
+
+    # ── Calibración end-to-end con spreads ────────────────────────────────────
+
+    # ── min_calibration_samples ────────────────────────────────────────────────
+
+    def test_min_samples_rejects_candidates_with_too_few_signals(self, db, make_signal):
+        """
+        Con min_calibration_samples=3, candidatos con < 3 señales se descartan
+        aunque tengan PnL alto. El threshold con muestra suficiente gana aunque
+        su PnL promedio sea menor.
+        """
+        base_ts = time.time()
+        # 5 señales con delta ≥ 0.10 → muestra suficiente para cualquier candidato
+        for i in range(5):
+            db.save_signal(make_signal(
+                market_ticker=f"KXETH-15MIN-B32{i}",
+                decision=Decision.YES,
+                market_probability=0.55,
+                delta=0.12,          # pasa threshold 0.10 y 0.12, NO pasa 0.15
+                ev_net_fees=0.07,
+                timestamp=base_ts + i,
+                outcome=Outcome.WIN if i < 3 else Outcome.LOSS,  # win_rate=60%
+            ))
+        # 1 señal con delta=0.15 → n=1, descartado si min_samples=3
+        db.save_signal(make_signal(
+            market_ticker="KXETH-15MIN-B3299",
+            decision=Decision.YES,
+            market_probability=0.55,
+            delta=0.15,
+            ev_net_fees=0.09,
+            timestamp=base_ts + 10,
+            outcome=Outcome.WIN,  # 100% win rate pero muestra de 1
+        ))
+
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.10, 0.12, 0.15),
+            ev_candidates=(0.04, 0.06),
+            min_calibration_samples=3,
+        )
+        results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 20, categories={"ETH"})
+
+        assert len(results) == 2
+        current = db.get_current_params(category="ETH")
+        # threshold 0.15 tiene n=1 < min_samples=3 → se descarta
+        # threshold 0.12 tiene n=5 (todos pasan ≥ 0.10 y ≥ 0.12)
+        # threshold 0.10 tiene n=6 (todos los de 0.12 + el de 0.15)
+        # entre 0.10 y 0.12, el que tiene mejor avg_pnl gana
+        assert current["min_delta"] in (0.10, 0.12)  # nunca 0.15 porque n=1 < 3
+
+    def test_min_samples_default_one_preserves_existing_behavior(self, db, make_signal):
+        """Con min_calibration_samples=1 (default), el comportamiento es idéntico al anterior."""
+        base_ts = time.time()
+        # 1 sola señal con delta=0.15
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95000",
+            delta=0.15,
+            ev_net_fees=0.09,
+            timestamp=base_ts + 1,
+            outcome=Outcome.WIN,
+        ))
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.10, 0.12, 0.15),
+            ev_candidates=(0.04, 0.06),
+            min_calibration_samples=1,  # default: acepta muestras de 1
+        )
+        results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 10, categories={"BTC"})
+        assert len(results) == 2
+        current = db.get_current_params(category="BTC")
+        # Con n=1 y min_samples=1, threshold 0.15 es válido
+        assert current["min_delta"] == 0.15
+
+    def test_min_samples_falls_back_to_first_candidate_when_all_below_threshold(
+        self, db, make_signal
+    ):
+        """Si todos los candidatos quedan bajo min_samples, devuelve el primero (más bajo)."""
+        base_ts = time.time()
+        # Solo 2 señales → con min_samples=3, todos los candidatos tienen n < 3
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95000",
+            delta=0.15,
+            ev_net_fees=0.09,
+            timestamp=base_ts + 1,
+            outcome=Outcome.WIN,
+        ))
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95100",
+            delta=0.12,
+            ev_net_fees=0.07,
+            timestamp=base_ts + 2,
+            outcome=Outcome.LOSS,
+        ))
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.10, 0.12, 0.15),
+            ev_candidates=(0.04, 0.06),
+            min_calibration_samples=3,
+        )
+        results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 10, categories={"BTC"})
+        # Todos los candidatos caen bajo min_samples → fallback al primero
+        current = db.get_current_params(category="BTC")
+        assert current["min_delta"] == 0.10  # candidates[0]
+
+    def test_calibration_with_contract_price_accounts_for_spread(self, db, make_signal):
+        """
+        Cuando los signals tienen contract_price guardado (spread real),
+        la calibración usa esos precios y no el mid, produciendo estimaciones
+        de PnL más conservadoras y thresholds que reflejan el coste real.
+        """
+        base_ts = time.time()
+        # Señal con spread grande: market_prob=0.55 pero pagamos 0.70 (ask)
+        # → gross WIN = 1.0 - 0.70 = 0.30 (vs 0.45 sin spread)
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95000",
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.70,
+            delta=0.15,
+            ev_net_fees=0.08,
+            timestamp=base_ts + 1,
+            outcome=Outcome.WIN,
+        ))
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95100",
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.70,
+            delta=0.12,
+            ev_net_fees=0.06,
+            timestamp=base_ts + 2,
+            outcome=Outcome.WIN,
+        ))
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-B95200",
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.70,
+            delta=0.20,
+            ev_net_fees=0.12,
+            timestamp=base_ts + 3,
+            outcome=Outcome.LOSS,
+        ))
+
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.10, 0.12, 0.15),
+            ev_candidates=(0.04, 0.06, 0.08),
+        )
+        # _signal_realized_pnl debe usar contract_price=0.70, no market_prob=0.55
+        # Se puede verificar que el injector realmente llama _effective_contract_price
+        signal = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=0.70,
+            outcome=Outcome.WIN,
+        )
+        pnl_with_price = injector._signal_realized_pnl(signal)
+
+        signal_no_price = make_signal(
+            decision=Decision.YES,
+            market_probability=0.55,
+            contract_price=None,
+            outcome=Outcome.WIN,
+        )
+        pnl_without_price = injector._signal_realized_pnl(signal_no_price)
+
+        # Con precio real de 0.70 en lugar de 0.55, la ganancia neta debe ser menor
+        assert pnl_with_price < pnl_without_price
+        # La calibración debe completarse sin errores
+        results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 10, categories={"BTC"})
+        assert len(results) == 2
+
 
 # ── Fix 3: OutcomeResolver ────────────────────────────────────────────────────
 
