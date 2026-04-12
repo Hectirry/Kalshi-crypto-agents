@@ -1122,6 +1122,118 @@ class TestSignalRouter:
         assert consult_kwargs["context"].social_sentiment.symbol == "ETH"
         assert 0.0 <= consult_kwargs["context"].live_features.rsi_14 <= 100.0
 
+    @pytest.mark.asyncio
+    async def test_evaluate_async_consults_agent_for_high_confidence_wide_spread(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+    ):
+        """
+        Una señal HIGH confidence con market_overround_bps > agent_review_overround_bps
+        debe escalar al agente LLM como filtro de liquidez, aunque normalmente
+        las señales HIGH entran directo.
+        """
+        from engine.openrouter_agent import AgentVerdict
+
+        mock_agent = AsyncMock()
+        mock_agent.consult = AsyncMock(
+            return_value=AgentVerdict(proceed=True, adjusted_kelly=0.05, reasoning="ok", tokens_used=5)
+        )
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=app_config.engine,  # agent_review_overround_bps=100, max=150
+            db=db,
+            blocked_categories=set(),
+            openrouter_agent=mock_agent,
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False, error_msg=None,
+            my_prob=0.70, market_prob=0.55, delta=0.15,
+            confidence=Confidence.HIGH,  # HIGH confidence
+        )
+        router.ev_calc.calculate.return_value = MagicMock(
+            ev_net=0.07, is_profitable=True
+        )
+        router.ev_calc.kelly_size.return_value = 0.05
+
+        # ETH (sin override de categoría) con spread ancho:
+        # yes_ask=0.562, no_ask=0.451 → overround = (1.013 - 1.0) * 10000 = 130 bps
+        # 130 bps > agent_review_overround_bps (100) y < max_market_overround_bps (150)
+        await router.evaluate_async(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3200",
+                yes_ask=0.562, no_ask=0.451, implied_prob=0.55, time_to_expiry_s=500,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        mock_agent.consult.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_evaluate_async_skips_agent_for_high_confidence_narrow_spread(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+    ):
+        """
+        Una señal HIGH confidence con market_overround_bps <= agent_review_overround_bps
+        debe entrar directo sin consultar al agente (comportamiento original).
+        """
+        from engine.openrouter_agent import AgentVerdict
+
+        mock_agent = AsyncMock()
+        mock_agent.consult = AsyncMock(
+            return_value=AgentVerdict(proceed=True, adjusted_kelly=0.05, reasoning="ok", tokens_used=5)
+        )
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=app_config.engine,  # agent_review_overround_bps=100
+            db=db,
+            blocked_categories=set(),
+            openrouter_agent=mock_agent,
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False, error_msg=None,
+            my_prob=0.70, market_prob=0.55, delta=0.15,
+            confidence=Confidence.HIGH,
+        )
+        router.ev_calc.calculate.return_value = MagicMock(
+            ev_net=0.07, is_profitable=True
+        )
+        router.ev_calc.kelly_size.return_value = 0.05
+
+        # ETH (sin override), spread estrecho:
+        # yes_ask=0.56, no_ask=0.44 → overround = 0 bps ≤ 100 → no escalation
+        await router.evaluate_async(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-B3201",
+                yes_ask=0.56, no_ask=0.44, implied_prob=0.55, time_to_expiry_s=500,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        mock_agent.consult.assert_not_awaited()
+
     def test_setup_quality_gate_skips_historically_weak_setup(
         self,
         app_config,
@@ -1194,6 +1306,103 @@ class TestSignalRouter:
 
         assert signal.decision == Decision.SKIP
         assert "setup_quality_gate" in signal.reasoning
+
+    def test_setup_quality_gate_allows_low_win_rate_when_ev_positive(
+        self,
+        app_config,
+        db,
+        make_market_snapshot,
+        make_price_snapshot,
+        make_signal,
+    ):
+        """
+        Cuando el win rate histórico está por debajo del mínimo pero el EV
+        estimado es positivo (ganancia media >> pérdida media), el gate debe
+        dejar pasar la señal con reason ``low_wr_ev_positive``.
+        """
+        from dataclasses import replace
+
+        cfg = replace(
+            app_config.engine,
+            setup_quality_gate_enabled=True,
+            setup_quality_min_samples=3,
+            setup_quality_min_win_rate=0.60,  # umbral alto a propósito
+        )
+        base_ts = time.time()
+
+        # 2 pérdidas con contrato barato (0.20) → pérdida = 0.20 por contrato
+        for idx in range(2):
+            db.save_signal(
+                make_signal(
+                    market_ticker=f"KXETH-15MIN-EV-L{idx}",
+                    decision=Decision.YES,
+                    delta=0.15,
+                    time_remaining_s=420,
+                    market_probability=0.20,
+                    contract_price=0.20,
+                    timestamp=base_ts - (300 - idx),
+                    outcome=Outcome.LOSS,
+                    outcome_at=base_ts - (200 - idx),
+                )
+            )
+        # 1 ganancia con contrato barato (0.20) → ganancia = 0.80 por contrato
+        # EV = 0.80 * (1/3) - 0.20 * (2/3) ≈ 0.267 - 0.133 = 0.133 → positivo
+        db.save_signal(
+            make_signal(
+                market_ticker="KXETH-15MIN-EV-W0",
+                decision=Decision.YES,
+                delta=0.15,
+                time_remaining_s=420,
+                market_probability=0.20,
+                contract_price=0.20,
+                timestamp=base_ts - 100,
+                outcome=Outcome.WIN,
+                outcome_at=base_ts - 50,
+            )
+        )
+
+        router = SignalRouter(
+            prob_engine=MagicMock(),
+            ev_calc=MagicMock(),
+            timing_filter=MagicMock(),
+            config=cfg,
+            db=db,
+            blocked_categories=set(),
+        )
+        router.timing_filter.should_enter.side_effect = [
+            MagicMock(allowed=True, reason="ok"),
+            MagicMock(allowed=True, reason="ok"),
+        ]
+        router.prob_engine.estimate.return_value = MagicMock(
+            error=False,
+            error_msg=None,
+            my_prob=0.70,
+            market_prob=0.55,
+            delta=0.15,
+            confidence=Confidence.HIGH,
+        )
+        router.ev_calc.calculate.return_value = MagicMock(
+            ev_gross=0.08,
+            fee_total=0.01,
+            ev_net=0.07,
+            is_profitable=True,
+            min_prob_to_profit=0.57,
+        )
+        router.ev_calc.kelly_size.return_value = 0.05
+
+        signal = router.evaluate(
+            market=make_market_snapshot(
+                category="ETH",
+                ticker="KXETH-15MIN-EV-NEW",
+                time_to_expiry_s=420,
+                timestamp=base_ts,
+            ),
+            price=make_price_snapshot(),
+            bankroll=1_000.0,
+        )
+
+        # EV positivo → no debe bloquear a pesar del bajo win rate (1/3 < 0.60)
+        assert signal.decision != Decision.SKIP
 
     def test_market_too_wide_skips_before_ev(
         self,

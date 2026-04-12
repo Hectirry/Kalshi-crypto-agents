@@ -24,6 +24,7 @@
     "min_contract_price": 0.10,
     "max_contract_price": 0.90,
     "max_market_overround_bps": 150.0,
+    "agent_review_overround_bps": 100.0,
     "setup_quality_gate_enabled": true,
     "setup_quality_min_samples": 3,
     "setup_quality_min_win_rate": 0.40,

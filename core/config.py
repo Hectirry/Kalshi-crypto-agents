@@ -69,6 +69,10 @@ class EngineConfig:
     min_contract_price:     float = 0.10  # Evita contratos demasiado baratos/caros
     max_contract_price:     float = 0.90
     max_market_overround_bps: float = 150.0
+    # Overround por encima del cual se consulta el agente LLM incluso para
+    # señales HIGH confidence (spread ancho → liquidez reducida → revisión).
+    # Debe ser < max_market_overround_bps para que tenga efecto.
+    agent_review_overround_bps: float = 100.0
     setup_quality_gate_enabled: bool = False
     setup_quality_min_samples: int = 3
     setup_quality_min_win_rate: float = 0.40
@@ -241,6 +245,7 @@ def load_config(config_file: str | Path | None = None) -> AppConfig:
         min_contract_price   = float(eng_cfg.get("min_contract_price", 0.10)),
         max_contract_price   = float(eng_cfg.get("max_contract_price", 0.90)),
         max_market_overround_bps = float(eng_cfg.get("max_market_overround_bps", 150.0)),
+        agent_review_overround_bps = float(eng_cfg.get("agent_review_overround_bps", 100.0)),
         setup_quality_gate_enabled = bool(eng_cfg.get("setup_quality_gate_enabled", False)),
         setup_quality_min_samples = int(eng_cfg.get("setup_quality_min_samples", 3)),
         setup_quality_min_win_rate = float(eng_cfg.get("setup_quality_min_win_rate", 0.40)),
@@ -412,6 +417,17 @@ def _validate_engine_config(cfg: EngineConfig) -> None:
     if cfg.max_market_overround_bps < 0.0:
         errors.append(
             "max_market_overround_bps no puede ser negativo: "
+            f"{cfg.max_market_overround_bps}"
+        )
+    if cfg.agent_review_overround_bps < 0.0:
+        errors.append(
+            "agent_review_overround_bps no puede ser negativo: "
+            f"{cfg.agent_review_overround_bps}"
+        )
+    if cfg.agent_review_overround_bps >= cfg.max_market_overround_bps:
+        errors.append(
+            "agent_review_overround_bps debe ser menor que max_market_overround_bps "
+            f"para tener efecto: {cfg.agent_review_overround_bps} >= "
             f"{cfg.max_market_overround_bps}"
         )
     if cfg.setup_quality_min_samples < 1:

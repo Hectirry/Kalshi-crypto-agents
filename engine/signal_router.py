@@ -48,6 +48,10 @@ class _DecisionThresholds:
     min_time_remaining_s: int
     min_contract_price: float
     max_contract_price: float
+    # Umbrales de tiempo calibrados por zona temporal; None → usar min_time_remaining_s
+    min_time_near: int | None = None
+    min_time_mid: int | None = None
+    min_time_far: int | None = None
 
 
 class SignalRouter:
@@ -139,10 +143,11 @@ class SignalRouter:
                     timestamp=market.timestamp,
                 )
 
+            zone_min_time = self._time_threshold_for_zone(probability.time_zone, thresholds)
             timing = self.timing_filter.should_enter(
                 time_remaining_s=market.time_to_expiry_s,
                 confidence=probability.confidence,
-                min_time_s=thresholds.min_time_remaining_s,
+                min_time_s=zone_min_time,
             )
             if not timing.allowed:
                 self._log_skip(market.ticker, timing.reason)
@@ -282,10 +287,15 @@ class SignalRouter:
         bankroll: float,
     ) -> Signal:
         """
-        Versión async de evaluate que consulta al agente LLM para señales MEDIUM.
+        Versión async de evaluate que consulta al agente LLM para señales MEDIUM
+        y para señales HIGH con mercado ilíquido (overround alto).
 
         Comportamiento:
-          - HIGH confidence: entra directo sin consultar (velocidad).
+          - HIGH confidence + overround <= agent_review_overround_bps:
+              entra directo sin consultar (velocidad).
+          - HIGH confidence + overround > agent_review_overround_bps:
+              consulta al agente como filtro de liquidez; spread ancho reduce
+              la fiabilidad del fill y puede eliminar el edge esperado.
           - MEDIUM confidence + agente configurado: consulta con timeout 3s.
           - LOW confidence: descartado por evaluate() antes de llegar aquí.
           - Si agent is None: idéntico a evaluate().
@@ -300,11 +310,24 @@ class SignalRouter:
         """
         signal = self.evaluate(market=market, price=price, bankroll=bankroll)
 
+        overround = signal.market_overround_bps or 0.0
+        high_with_wide_spread = (
+            signal.confidence == Confidence.HIGH
+            and overround > self.config.agent_review_overround_bps
+        )
+
         if (
             self.openrouter_agent is not None
-            and signal.confidence == Confidence.MEDIUM
             and signal.is_actionable
+            and (signal.confidence == Confidence.MEDIUM or high_with_wide_spread)
         ):
+            if high_with_wide_spread:
+                logger.info(
+                    "agent_review_wide_spread ticker=%s overround_bps=%.1f threshold=%.1f",
+                    signal.market_ticker,
+                    overround,
+                    self.config.agent_review_overround_bps,
+                )
             live_features = self._build_live_features(
                 signal=signal,
                 market=market,
@@ -423,6 +446,17 @@ class SignalRouter:
 
         params = self.db.get_current_params(category=category)
         override = self._category_override(category)
+        base_time = max(
+            self.config.min_time_remaining_s,
+            override.min_time_remaining_s if override.min_time_remaining_s is not None else self.config.min_time_remaining_s,
+        )
+
+        def _zone_time(zone_key: str) -> int | None:
+            raw = params.get(zone_key)
+            if raw is None:
+                return None
+            return max(base_time, int(raw))
+
         return _DecisionThresholds(
             min_delta=max(
                 params.get("min_delta", self.config.min_delta),
@@ -432,10 +466,7 @@ class SignalRouter:
                 params.get("min_ev_threshold", self.config.min_ev_threshold),
                 override.min_ev_threshold if override.min_ev_threshold is not None else self.config.min_ev_threshold,
             ),
-            min_time_remaining_s=max(
-                self.config.min_time_remaining_s,
-                override.min_time_remaining_s if override.min_time_remaining_s is not None else self.config.min_time_remaining_s,
-            ),
+            min_time_remaining_s=base_time,
             min_contract_price=max(
                 self.config.min_contract_price,
                 override.min_contract_price if override.min_contract_price is not None else self.config.min_contract_price,
@@ -444,6 +475,9 @@ class SignalRouter:
                 self.config.max_contract_price,
                 override.max_contract_price if override.max_contract_price is not None else self.config.max_contract_price,
             ),
+            min_time_near=_zone_time("min_time_remaining_s_NEAR"),
+            min_time_mid=_zone_time("min_time_remaining_s_MID"),
+            min_time_far=_zone_time("min_time_remaining_s_FAR"),
         )
 
     def _category_override(self, category: str | None) -> EngineCategoryOverride:
@@ -452,6 +486,28 @@ class SignalRouter:
         if category is None:
             return EngineCategoryOverride()
         return self.config.category_overrides.get(category.upper(), EngineCategoryOverride())
+
+    @staticmethod
+    def _time_threshold_for_zone(zone: str, thresholds: _DecisionThresholds) -> int:
+        """
+        Retorna el umbral de tiempo mínimo calibrado para la zona dada.
+
+        Si no existe un parámetro específico de zona en DB (campo ``None``),
+        cae al ``min_time_remaining_s`` global del config como fallback.
+
+        Args:
+            zone: constante de ``TimeZone`` (NEAR, MID, FAR).
+            thresholds: umbrales resueltos para la evaluación actual.
+
+        Returns:
+            Segundos mínimos requeridos para la zona indicada.
+        """
+        zone_value = {
+            "NEAR": thresholds.min_time_near,
+            "MID": thresholds.min_time_mid,
+            "FAR": thresholds.min_time_far,
+        }.get(zone)
+        return zone_value if zone_value is not None else thresholds.min_time_remaining_s
 
     def _is_contract_price_allowed(
         self,

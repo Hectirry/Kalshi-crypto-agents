@@ -50,6 +50,8 @@ class PositionManager:
         min_win_rate: float = 0.35,
         min_total_pnl: float = 0.0,
         max_drawdown_pct: float = 0.50,
+        time_exit_threshold_s: int = 60,
+        time_exit_profit_pct: float = 0.08,
     ) -> None:
         """
         Inicializa el manager de posiciones.
@@ -57,14 +59,20 @@ class PositionManager:
         Args:
             db: base de datos del proyecto.
             executor: ejecutor de órdenes.
-            stop_loss_pct: porcentaje de stop loss.
-            take_profit_pct: porcentaje de take profit.
+            stop_loss_pct: porcentaje de stop loss precio-relativo.
+            take_profit_pct: porcentaje de take profit precio-relativo.
+            time_exit_threshold_s: segundos restantes por debajo de los cuales
+                se activa la salida anticipada por tiempo (default 60 s).
+            time_exit_profit_pct: beneficio mínimo relativo al entry para cerrar
+                anticipadamente cuando el tiempo es bajo (default 8 %).
         """
 
         self.db = db
         self.executor = executor
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.time_exit_threshold_s = time_exit_threshold_s
+        self.time_exit_profit_pct = time_exit_profit_pct
         self.initial_bankroll = initial_bankroll
         self.min_closed_trades = min_closed_trades
         self.min_win_rate = min_win_rate
@@ -81,6 +89,23 @@ class PositionManager:
         self._latest_marks: dict[int, float] = {}
         self._last_risk_reason: str | None = None
         self._open_lock = asyncio.Lock()
+        # Safe mode: si True, ningún trade nuevo puede abrirse
+        self._safe_mode: bool = False
+        self._safe_mode_reason: str | None = None
+
+    # ── Safe Mode ─────────────────────────────────────────────────────────────
+
+    def enter_safe_mode(self, reason: str) -> None:
+        """Activa el modo seguro: bloquea toda apertura de nuevos trades."""
+        if not self._safe_mode:
+            logger.warning("SAFE_MODE_ACTIVATED reason=%s", reason)
+        self._safe_mode = True
+        self._safe_mode_reason = reason
+
+    @property
+    def is_safe_mode(self) -> bool:
+        """True si el sistema está en modo seguro."""
+        return self._safe_mode
 
     def sync_open_trades(self) -> list[Trade]:
         """Sincroniza el estado in-memory desde SQLite."""
@@ -95,31 +120,42 @@ class PositionManager:
         return list(self.open_positions.values())
 
     async def hydrate_from_db(self, db: Database | None = None, closed_limit: int = 200) -> None:
-        """Hidrata contexto histórico y PnL realizado desde SQLite."""
+        """
+        Hidrata contexto histórico y PnL realizado desde SQLite.
 
-        source = db or self.db
-        trade_mode = TradeMode(self.executor.mode)
-        closed = source.get_closed_trades(limit=closed_limit, mode=trade_mode)
-        self.closed_positions = list(reversed(closed))
-        self.traded_tickers = {trade.ticker for trade in self.closed_positions}
-        self.close_reasons = {
-            trade.id: "hydrated"
-            for trade in self.closed_positions
-            if trade.id is not None
-        }
-        summary = source.get_trade_pnl_summary(mode=trade_mode)
-        self.realized_pnl = float(summary["realized_pnl"])
-        self.unrealized_pnl = 0.0
-        self.total_pnl = self.realized_pnl
-        self.sync_open_trades()
-        logger.info(
-            "Hydrated PositionManager: closed=%d pnl=%.4f realized=%.4f open=%d",
-            len(self.closed_positions),
-            self.total_pnl,
-            self.realized_pnl,
-            len(self.open_positions),
-        )
-        logger.info("Paper account PnL: %.4f", self.total_pnl)
+        Si la hidratación falla, entra en safe mode para evitar operar con
+        estado inconsistente. La excepción NO se propaga al llamador.
+        """
+        try:
+            source = db or self.db
+            trade_mode = TradeMode(self.executor.mode)
+            closed = source.get_closed_trades(limit=closed_limit, mode=trade_mode)
+            self.closed_positions = list(reversed(closed))
+            self.traded_tickers = {trade.ticker for trade in self.closed_positions}
+            self.close_reasons = {
+                trade.id: "hydrated"
+                for trade in self.closed_positions
+                if trade.id is not None
+            }
+            summary = source.get_trade_pnl_summary(mode=trade_mode)
+            self.realized_pnl = float(summary["realized_pnl"])
+            self.unrealized_pnl = 0.0
+            self.total_pnl = self.realized_pnl
+            self.sync_open_trades()
+            logger.info(
+                "hydration_complete closed=%d pnl=%.4f realized=%.4f open=%d",
+                len(self.closed_positions),
+                self.total_pnl,
+                self.realized_pnl,
+                len(self.open_positions),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.enter_safe_mode(reason=f"hydration_failed:{exc}")
+            logger.error(
+                "hydration_failed exc=%s — entered safe mode, no trading allowed",
+                exc,
+            )
+            raise
 
     async def register_trade(self, trade: Trade) -> Trade:
         """Registra un trade abierto dentro del manager."""
@@ -191,6 +227,7 @@ class PositionManager:
         ticker: str,
         current_yes_price: float,
         current_no_price: float | None = None,
+        time_remaining_s: int | None = None,
     ) -> list[ManagedClose]:
         """
         Evalúa SL/TP para todas las posiciones abiertas de un ticker.
@@ -200,6 +237,10 @@ class PositionManager:
             current_yes_price: precio actual del lado YES.
             current_no_price: precio actual del lado NO. Si no se pasa,
                 se usa ``1 - current_yes_price``.
+            time_remaining_s: segundos restantes hasta expiración. Cuando
+                está por debajo de ``time_exit_threshold_s`` y la posición
+                tiene beneficio suficiente, se cierra con razón
+                ``time_exit_profit``.
         """
 
         closes: list[ManagedClose] = []
@@ -210,11 +251,24 @@ class PositionManager:
             current_no_price=effective_no_price,
         )
 
+        near_expiry = (
+            time_remaining_s is not None
+            and time_remaining_s <= self.time_exit_threshold_s
+        )
+
         for trade_id, trade in list(self.open_positions.items()):
             if trade.ticker != ticker:
                 continue
 
             current_price = current_yes_price if trade.side == "YES" else effective_no_price
+
+            # Salida anticipada por tiempo: si quedan pocos segundos y la posición
+            # ya alcanzó el umbral mínimo de beneficio, asegurar la ganancia.
+            if near_expiry and current_price >= trade.entry_price * (1.0 + self.time_exit_profit_pct):
+                closed = await self.close_trade(trade, current_price, "time_exit_profit")
+                closes.append(closed)
+                continue
+
             if current_price <= trade.entry_price * (1.0 - self.stop_loss_pct):
                 closed = await self.close_trade(trade, current_price, "stop_loss")
                 closes.append(closed)
@@ -277,6 +331,18 @@ class PositionManager:
     ) -> GoNoGoStatus:
         """Determina si el sistema debería seguir operando."""
 
+        # Safe mode is a hard stop — overrides every other check
+        if self._safe_mode:
+            status = GoNoGoStatus(
+                allowed=False,
+                reason=f"safe_mode:{self._safe_mode_reason}",
+                closed_trades=len(self.closed_positions),
+                win_rate=self._win_rate(),
+                total_pnl=self.total_pnl,
+            )
+            self._log_risk_transition(status)
+            return status
+
         min_closed_trades = self.min_closed_trades if min_closed_trades is None else min_closed_trades
         min_win_rate = self.min_win_rate if min_win_rate is None else min_win_rate
         min_total_pnl = self.min_total_pnl if min_total_pnl is None else min_total_pnl
@@ -284,6 +350,19 @@ class PositionManager:
         relevant_closed = self._closed_positions_for_category(category)
         closed_count = len(relevant_closed)
         relevant_total_pnl = sum(trade.pnl or 0.0 for trade in relevant_closed)
+
+        # Hard capital floor: stop trading if effective balance has reached zero
+        if self.initial_bankroll + self.total_pnl <= 0.0:
+            status = GoNoGoStatus(
+                allowed=False,
+                reason="account_balance_depleted",
+                closed_trades=closed_count,
+                win_rate=self._win_rate(relevant_closed),
+                total_pnl=self.total_pnl,
+            )
+            self._log_risk_transition(status)
+            return status
+
         if max_open_positions is not None and len(self.open_positions) >= max_open_positions:
             status = GoNoGoStatus(
                 allowed=False,

@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from core.database import Database
 from core.models import Decision, Outcome, Signal
 from engine.ev_calculator import EVCalculator
+from engine.probability import classify_time_zone
 
 logger = logging.getLogger(__name__)
+
+_TIME_ZONES = ("NEAR", "MID", "FAR")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,7 @@ class ParamInjector:
         db: Database,
         delta_candidates: tuple[float, ...] = (0.05, 0.08, 0.10, 0.12, 0.15),
         ev_candidates: tuple[float, ...] = (0.04, 0.06, 0.10, 0.20),
+        time_candidates: tuple[int, ...] = (90, 150, 180, 240, 300),
         min_calibration_samples: int = 1,
     ) -> None:
         """
@@ -44,6 +48,7 @@ class ParamInjector:
             db: base de datos del proyecto.
             delta_candidates: candidatos de ``min_delta`` a evaluar.
             ev_candidates: candidatos de ``min_ev_threshold`` a evaluar.
+            time_candidates: candidatos de ``min_time_remaining_s`` a evaluar (s).
             min_calibration_samples: muestra mínima para considerar un candidato
                 válido. Candidatos con menos muestras se tratan como vacíos y no
                 se seleccionan. Con el default=1 se mantiene la conducta anterior.
@@ -54,6 +59,7 @@ class ParamInjector:
         self.db = db
         self.delta_candidates = delta_candidates
         self.ev_candidates = ev_candidates
+        self.time_candidates = time_candidates
         self.min_calibration_samples = min_calibration_samples
         self.ev_calculator = EVCalculator()
 
@@ -100,6 +106,11 @@ class ParamInjector:
                 candidates=self.ev_candidates,
                 selector=lambda signal, threshold: signal.ev_net_fees >= threshold,
             )
+            best_time = self._best_threshold(
+                signals=signals,
+                candidates=self.time_candidates,
+                selector=lambda signal, threshold: signal.time_remaining_s >= threshold,
+            )
 
             delta_result = ParamCalibration(
                 param_key="min_delta",
@@ -115,8 +126,15 @@ class ParamInjector:
                 win_rate=best_ev[1],
                 sample_size=best_ev[2],
             )
+            time_result = ParamCalibration(
+                param_key="min_time_remaining_s",
+                param_value=best_time[0],
+                category=category,
+                win_rate=best_time[1],
+                sample_size=best_time[2],
+            )
 
-            for calibration in (delta_result, ev_result):
+            for calibration in (delta_result, ev_result, time_result):
                 self.db.upsert_param(
                     key=calibration.param_key,
                     value=calibration.param_value,
@@ -132,6 +150,55 @@ class ParamInjector:
                     calibration.param_value,
                     calibration.win_rate,
                     calibration.sample_size,
+                )
+
+            # ── Calibración de min_time_remaining_s por zona temporal ──────────
+            for zone in _TIME_ZONES:
+                zone_signals = [
+                    s for s in signals
+                    if classify_time_zone(s.time_remaining_s) == zone
+                ]
+                if not zone_signals:
+                    logger.info(
+                        "param_calibration_skipped category=%s zone=%s reason=no_signals",
+                        category or "ALL",
+                        zone,
+                    )
+                    continue
+
+                zone_time = self._best_threshold(
+                    signals=zone_signals,
+                    candidates=self.time_candidates,
+                    selector=lambda signal, threshold: signal.time_remaining_s >= threshold,
+                )
+                if zone_time[2] == 0:
+                    # todos los candidatos estaban por debajo de min_calibration_samples
+                    continue
+
+                param_key = f"min_time_remaining_s_{zone}"
+                zone_calibration = ParamCalibration(
+                    param_key=param_key,
+                    param_value=zone_time[0],
+                    category=category,
+                    win_rate=zone_time[1],
+                    sample_size=zone_time[2],
+                )
+                self.db.upsert_param(
+                    key=zone_calibration.param_key,
+                    value=zone_calibration.param_value,
+                    category=zone_calibration.category,
+                    win_rate=zone_calibration.win_rate,
+                    sample_size=zone_calibration.sample_size,
+                )
+                results.append(zone_calibration)
+                logger.info(
+                    "param_calibrated key=%s category=%s zone=%s value=%.4f win_rate=%.4f sample=%s",
+                    zone_calibration.param_key,
+                    zone_calibration.category or "ALL",
+                    zone,
+                    zone_calibration.param_value,
+                    zone_calibration.win_rate,
+                    zone_calibration.sample_size,
                 )
 
         return results
@@ -174,7 +241,7 @@ class ParamInjector:
     def _best_threshold(
         self,
         signals: list[Signal],
-        candidates: tuple[float, ...],
+        candidates: tuple[float, ...] | tuple[int, ...],
         selector,
     ) -> tuple[float, float, int]:
         """

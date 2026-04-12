@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -353,11 +354,11 @@ async def _run_orchestrator(
                 name="supervisor",
             ),
             asyncio.create_task(
-                _recal_task(db, router, bankroll),
+                _recal_task(cfg, db, router, bankroll),
                 name="recal",
             ),
             asyncio.create_task(
-                _outcome_task(resolver, db, router, bankroll),
+                _outcome_task(cfg, resolver, db, router, bankroll),
                 name="outcome_resolver",
             ),
             asyncio.create_task(
@@ -428,6 +429,11 @@ async def _market_task(
         )
 
 
+def _log_decision(**kwargs: object) -> None:
+    """Emite un registro de decisión estructurado en JSON para auditoría."""
+    logger.info("decision_record %s", json.dumps(kwargs, default=str))
+
+
 async def _process_market(
     market,
     router: SignalRouter,
@@ -460,6 +466,7 @@ async def _process_market(
     closes = await pos_mgr.evaluate_price(
         ticker=ticker,
         current_yes_price=market.implied_prob,
+        time_remaining_s=market.time_to_expiry_s,
     )
     for mc in closes:
         logger.info(
@@ -495,7 +502,15 @@ async def _process_market(
     if signal.is_actionable:
         status = pos_mgr.go_no_go_status(max_open_positions=max_positions, category=market.category)
         if not status.allowed:
-            logger.info("TRADE_BLOCKED go=%s reason=%s ticker=%s", status.allowed, status.reason, ticker)
+            _log_decision(
+                event="trade_blocked",
+                ticker=ticker,
+                decision=signal.decision.value,
+                reason=status.reason,
+                go=False,
+                delta=signal.delta,
+                ev_net=signal.ev_net_fees,
+            )
             if memory_adapter is not None:
                 memory_adapter.record_trade_blocked(ticker=ticker, reason=status.reason)
             return
@@ -503,10 +518,17 @@ async def _process_market(
         if trade is None:
             return
         zone = classify_time_zone(market.time_to_expiry_s)
-        logger.info(
-            "trade_opened ticker=%s side=%s contracts=%d entry=%.4f delta=%.4f zone=%s",
-            trade.ticker, trade.side, trade.contracts, trade.entry_price,
-            signal.delta, zone,
+        _log_decision(
+            event="trade_opened",
+            ticker=trade.ticker,
+            decision=trade.side,
+            reason="signal_actionable",
+            go=True,
+            delta=signal.delta,
+            ev_net=signal.ev_net_fees,
+            contracts=trade.contracts,
+            entry_price=trade.entry_price,
+            zone=zone,
         )
         if memory_adapter is not None:
             memory_adapter.record_trade_open(trade, signal, price.source)
@@ -564,7 +586,7 @@ async def _supervisor_task(pos_mgr: PositionManager, db: Database) -> None:
         )
 
 
-async def _recal_task(db: Database, router: SignalRouter, bankroll: float) -> None:
+async def _recal_task(cfg: AppConfig, db: Database, router: SignalRouter, bankroll: float) -> None:
     """Recalibra parámetros y bloqueos cada 24h."""
     while True:
         await asyncio.sleep(RECALIBRATE_INTERVAL_S)
@@ -576,6 +598,7 @@ async def _recal_task(db: Database, router: SignalRouter, bankroll: float) -> No
 
 
 async def _outcome_task(
+    cfg: AppConfig,
     resolver: OutcomeResolver,
     db: Database,
     router: SignalRouter,

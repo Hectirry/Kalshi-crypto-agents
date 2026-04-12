@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import backtesting.backtest_runner as backtest_runner_module
-from backtesting.backtest_runner import BacktestRunner
+from backtesting.backtest_runner import BacktestRunner, ZoneMetrics
 from backtesting.category_blocker import CategoryBlocker
 from backtesting.outcome_resolver import OutcomeResolver
 from backtesting.param_injector import ParamInjector
@@ -504,6 +504,94 @@ class TestCategoryBlocker:
         assert injector._signal_won(signal) is True
 
 
+    # ── Tests de breakdowns por zona y hora ───────────────────────────────────
+
+    def test_results_by_zone_populated(self, db, make_signal):
+        """
+        BacktestResult debe tener results_by_zone con métricas por zona NEAR/MID/FAR.
+        """
+        base_ts = time.time()
+        # NEAR (time=200), MID (time=500), FAR (time=700)
+        for i, (ticker, time_s, outcome) in enumerate([
+            ("KXBTC-15MIN-ZN0", 200, Outcome.WIN),
+            ("KXBTC-15MIN-ZM0", 500, Outcome.WIN),
+            ("KXBTC-15MIN-ZF0", 700, Outcome.LOSS),
+        ]):
+            db.save_signal(make_signal(
+                market_ticker=ticker,
+                time_remaining_s=time_s,
+                timestamp=base_ts + i + 1,
+                outcome=outcome,
+            ))
+
+        runner = BacktestRunner(db=db)
+        result = runner.run(from_ts=base_ts, to_ts=base_ts + 10)
+
+        assert isinstance(result.results_by_zone, dict)
+        assert "NEAR" in result.results_by_zone
+        assert "MID" in result.results_by_zone
+        assert "FAR" in result.results_by_zone
+
+        near = result.results_by_zone["NEAR"]
+        assert isinstance(near, ZoneMetrics)
+        assert near.wins == 1
+        assert near.losses == 0
+        assert near.win_rate == pytest.approx(1.0)
+
+        far = result.results_by_zone["FAR"]
+        assert far.wins == 0
+        assert far.losses == 1
+        assert far.win_rate == pytest.approx(0.0)
+
+    def test_results_by_hour_populated(self, db, make_signal):
+        """
+        BacktestResult debe tener results_by_hour con métricas por hora UTC.
+        """
+        import datetime as dt
+
+        base_ts = time.time()
+        # Dos señales en la misma hora UTC, una en otra hora
+        ts_h0 = dt.datetime(2025, 1, 1, 10, 0, 0, tzinfo=dt.timezone.utc).timestamp()
+        ts_h1 = dt.datetime(2025, 1, 1, 10, 30, 0, tzinfo=dt.timezone.utc).timestamp()
+        ts_h2 = dt.datetime(2025, 1, 1, 14, 0, 0, tzinfo=dt.timezone.utc).timestamp()
+        for i, (ticker, ts, outcome) in enumerate([
+            ("KXETH-15MIN-H0A", ts_h0, Outcome.WIN),
+            ("KXETH-15MIN-H0B", ts_h1, Outcome.LOSS),
+            ("KXETH-15MIN-H2A", ts_h2, Outcome.WIN),
+        ]):
+            db.save_signal(make_signal(
+                market_ticker=ticker,
+                timestamp=ts,
+                outcome=outcome,
+            ))
+
+        runner = BacktestRunner(db=db)
+        result = runner.run(from_ts=ts_h0 - 1, to_ts=ts_h2 + 1)
+
+        assert isinstance(result.results_by_hour, dict)
+        assert 10 in result.results_by_hour
+        assert 14 in result.results_by_hour
+
+        hour10 = result.results_by_hour[10]
+        assert hour10.wins == 1
+        assert hour10.losses == 1
+        assert hour10.win_rate == pytest.approx(0.5)
+
+        hour14 = result.results_by_hour[14]
+        assert hour14.wins == 1
+        assert hour14.losses == 0
+
+    def test_empty_backtest_has_empty_breakdowns(self, db):
+        """
+        Backtest sin señales actionables devuelve dicts vacíos para breakdowns.
+        """
+        runner = BacktestRunner(db=db)
+        result = runner.run(from_ts=0.0, to_ts=1.0)
+
+        assert result.results_by_zone == {}
+        assert result.results_by_hour == {}
+
+
 class TestParamInjector:
     def test_calibrates_and_persists_best_thresholds(self, db, make_signal):
         base_ts = time.time()
@@ -551,7 +639,7 @@ class TestParamInjector:
             categories={"BTC"},
         )
 
-        assert len(results) == 2
+        assert len(results) >= 2
         current = db.get_current_params(category="BTC")
         assert "min_delta" in current
         assert "min_ev_threshold" in current
@@ -590,7 +678,7 @@ class TestParamInjector:
             categories={"BTC"},
         )
 
-        assert len(results) == 2
+        assert len(results) >= 2
         current = db.get_current_params(category="BTC")
         assert current["min_delta"] == 0.12
         assert current["min_ev_threshold"] == 0.06
@@ -750,7 +838,7 @@ class TestParamInjector:
         )
         results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 20, categories={"ETH"})
 
-        assert len(results) == 2
+        assert len(results) >= 2
         current = db.get_current_params(category="ETH")
         # threshold 0.15 tiene n=1 < min_samples=3 → se descarta
         # threshold 0.12 tiene n=5 (todos pasan ≥ 0.10 y ≥ 0.12)
@@ -776,7 +864,7 @@ class TestParamInjector:
             min_calibration_samples=1,  # default: acepta muestras de 1
         )
         results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 10, categories={"BTC"})
-        assert len(results) == 2
+        assert len(results) >= 2
         current = db.get_current_params(category="BTC")
         # Con n=1 y min_samples=1, threshold 0.15 es válido
         assert current["min_delta"] == 0.15
@@ -879,7 +967,127 @@ class TestParamInjector:
         assert pnl_with_price < pnl_without_price
         # La calibración debe completarse sin errores
         results = injector.calibrate(from_ts=base_ts, to_ts=base_ts + 10, categories={"BTC"})
-        assert len(results) == 2
+        assert len(results) >= 2
+
+    # ── Tests de calibración de min_time_remaining_s ──────────────────────────
+
+    def test_calibrate_includes_min_time_remaining_s(self, db, make_signal):
+        """
+        calibrate() debe devolver calibraciones que incluyen ``min_time_remaining_s``
+        además de ``min_delta`` y ``min_ev_threshold``.
+        """
+        base_ts = time.time()
+        # Cuatro señales en zona MID (time_remaining_s=500 → 301-600 s)
+        for i, (delta, ev, outcome) in enumerate([
+            (0.12, 0.06, Outcome.WIN),
+            (0.10, 0.05, Outcome.WIN),
+            (0.08, 0.04, Outcome.WIN),
+            (0.06, 0.03, Outcome.LOSS),
+        ]):
+            db.save_signal(make_signal(
+                market_ticker=f"KXETH-15MIN-B{3000 + i}",
+                delta=delta,
+                ev_net_fees=ev,
+                time_remaining_s=500,
+                timestamp=base_ts + i + 1,
+                outcome=outcome,
+            ))
+
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.06, 0.08, 0.10, 0.12),
+            ev_candidates=(0.03, 0.04, 0.05, 0.06),
+            time_candidates=(90, 150, 180, 240, 300),
+        )
+        results = injector.calibrate(
+            from_ts=base_ts,
+            to_ts=base_ts + 10,
+            categories={"ETH"},
+        )
+
+        param_keys = {r.param_key for r in results}
+        assert "min_delta" in param_keys
+        assert "min_ev_threshold" in param_keys
+        assert "min_time_remaining_s" in param_keys
+
+        # Debe también estar persistido en DB
+        current = db.get_current_params(category="ETH")
+        assert "min_time_remaining_s" in current
+
+    def test_calibrate_zone_far_produces_higher_time_threshold_than_near(self, db, make_signal):
+        """
+        Señales en zona FAR con peor win rate deben producir un
+        ``min_time_remaining_s_FAR`` más alto que el de zona NEAR con buen win rate.
+
+        Setup:
+          - NEAR (time=200 s): 4 señales ganadoras → la calibración prefiere el
+            umbral de tiempo más bajo posible (90 s), porque hay buen PnL a
+            cualquier umbral.
+          - FAR (time=700 s): 3 señales perdedoras + 1 ganadora con high time →
+            la calibración selecciona un umbral alto (300 s) para filtrar las
+            pérdidas de tiempo bajo.
+        """
+        base_ts = time.time()
+
+        # Zona NEAR: time_remaining_s=200 → classify_time_zone(200) == "NEAR"
+        for i in range(4):
+            db.save_signal(make_signal(
+                market_ticker=f"KXBTC-15MIN-NEAR{i}",
+                delta=0.15,
+                ev_net_fees=0.08,
+                time_remaining_s=200,
+                timestamp=base_ts + i + 1,
+                outcome=Outcome.WIN,
+            ))
+
+        # Zona FAR: time_remaining_s varia
+        # Señal perdedora a tiempo bajo (610 s) — FAR pero el umbral 90/150/180/240 las incluye
+        for i in range(3):
+            db.save_signal(make_signal(
+                market_ticker=f"KXBTC-15MIN-FAR-LOW{i}",
+                delta=0.10,
+                ev_net_fees=0.05,
+                time_remaining_s=620,
+                timestamp=base_ts + 10 + i,
+                outcome=Outcome.LOSS,
+            ))
+        # Señal ganadora solo a tiempo alto (720 s)
+        db.save_signal(make_signal(
+            market_ticker="KXBTC-15MIN-FAR-HIGH0",
+            delta=0.20,
+            ev_net_fees=0.12,
+            time_remaining_s=720,
+            timestamp=base_ts + 14,
+            outcome=Outcome.WIN,
+        ))
+
+        injector = ParamInjector(
+            db=db,
+            delta_candidates=(0.05, 0.10, 0.15),
+            ev_candidates=(0.03, 0.06, 0.10),
+            time_candidates=(90, 150, 240, 300),
+            min_calibration_samples=1,
+        )
+        results = injector.calibrate(
+            from_ts=base_ts,
+            to_ts=base_ts + 20,
+            categories={"BTC"},
+        )
+
+        near_results = [r for r in results if r.param_key == "min_time_remaining_s_NEAR"]
+        far_results = [r for r in results if r.param_key == "min_time_remaining_s_FAR"]
+
+        # Debe haber calibraciones para ambas zonas
+        assert near_results, "Esperaba calibración para zona NEAR"
+        assert far_results, "Esperaba calibración para zona FAR"
+
+        near_threshold = near_results[0].param_value
+        far_threshold = far_results[0].param_value
+
+        # FAR con señales perdedoras a tiempo bajo debe calibrar threshold más alto
+        assert far_threshold > near_threshold, (
+            f"Se esperaba far_threshold({far_threshold}) > near_threshold({near_threshold})"
+        )
 
 
 # ── Fix 3: OutcomeResolver ────────────────────────────────────────────────────

@@ -408,6 +408,88 @@ class TestPositionManager:
         assert eth_status.reason == "go"
 
     @pytest.mark.asyncio
+    async def test_time_exit_profit_triggers_when_near_expiry_and_in_profit(self, db, make_signal):
+        """
+        evaluate_price con time_remaining_s <= threshold y precio >= entry * (1 + pct)
+        debe cerrar la posición con reason ``time_exit_profit``.
+        """
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(
+            db=db,
+            executor=executor,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.20,  # umbral normal alto (no activado)
+            time_exit_threshold_s=60,
+            time_exit_profit_pct=0.08,
+        )
+        trade = await manager.open_from_signal(
+            make_signal(decision=Decision.YES, market_probability=0.50, kelly_size=0.10)
+        )
+
+        closes = await manager.evaluate_price(
+            ticker=trade.ticker,
+            current_yes_price=0.55,  # +10 % sobre entry 0.50 ≥ time_exit_profit_pct 0.08
+            time_remaining_s=45,     # por debajo del threshold de 60 s
+        )
+
+        assert len(closes) == 1
+        assert closes[0].reason == "time_exit_profit"
+
+    @pytest.mark.asyncio
+    async def test_time_exit_profit_does_not_trigger_when_not_near_expiry(self, db, make_signal):
+        """
+        Con time_remaining_s > threshold no debe activarse la salida anticipada
+        aunque el beneficio supere time_exit_profit_pct.
+        """
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(
+            db=db,
+            executor=executor,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.20,
+            time_exit_threshold_s=60,
+            time_exit_profit_pct=0.08,
+        )
+        trade = await manager.open_from_signal(
+            make_signal(decision=Decision.YES, market_probability=0.50, kelly_size=0.10)
+        )
+
+        closes = await manager.evaluate_price(
+            ticker=trade.ticker,
+            current_yes_price=0.55,  # +10 % → cumpliría time_exit_profit_pct
+            time_remaining_s=200,    # pero tiempo suficiente → no se activa
+        )
+
+        assert closes == []  # tampoco alcanza take_profit_pct=0.20
+
+    @pytest.mark.asyncio
+    async def test_time_exit_profit_does_not_trigger_when_profit_below_threshold(self, db, make_signal):
+        """
+        Con tiempo bajo pero beneficio por debajo de time_exit_profit_pct,
+        no se cierra la posición.
+        """
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(
+            db=db,
+            executor=executor,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.20,
+            time_exit_threshold_s=60,
+            time_exit_profit_pct=0.08,
+        )
+        trade = await manager.open_from_signal(
+            make_signal(decision=Decision.YES, market_probability=0.50, kelly_size=0.10)
+        )
+
+        closes = await manager.evaluate_price(
+            ticker=trade.ticker,
+            current_yes_price=0.52,  # +4 % < time_exit_profit_pct 0.08
+            time_remaining_s=30,
+        )
+
+        assert closes == []
+
+    @pytest.mark.asyncio
     async def test_process_market_blocks_trade_when_go_no_go_false(
         self,
         db,
@@ -431,3 +513,92 @@ class TestPositionManager:
         )
 
         manager.try_open_from_signal.assert_not_called()  # type: ignore[attr-defined]
+
+    # ── Safe Mode tests ────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_enter_safe_mode_blocks_go_no_go(self, db, make_signal):
+        """Cuando safe mode está activo, go_no_go_status devuelve allowed=False."""
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(db=db, executor=executor, min_closed_trades=0, min_win_rate=0.0)
+
+        assert not manager.is_safe_mode
+        manager.enter_safe_mode(reason="test_trigger")
+
+        status = manager.go_no_go_status()
+
+        assert status.allowed is False
+        assert "safe_mode" in status.reason
+        assert manager.is_safe_mode
+
+    @pytest.mark.asyncio
+    async def test_safe_mode_raises_on_try_open(self, db, make_signal):
+        """try_open_from_signal lanza RuntimeError cuando safe mode está activo."""
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(db=db, executor=executor, min_closed_trades=0, min_win_rate=0.0)
+        manager.enter_safe_mode(reason="hydration_failed")
+
+        with pytest.raises(RuntimeError, match="Risk violation"):
+            await manager.try_open_from_signal(make_signal(), max_positions=3)
+
+    @pytest.mark.asyncio
+    async def test_hydration_failure_enters_safe_mode(self, db):
+        """Si hydrate_from_db falla, el manager entra en safe mode."""
+        import sqlite3
+
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(db=db, executor=executor)
+
+        # Cerrar la conexión de DB para forzar el fallo de hidratación
+        db.close()
+
+        with pytest.raises(Exception):
+            await manager.hydrate_from_db()
+
+        assert manager.is_safe_mode
+        assert manager._safe_mode_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_account_balance_depleted_blocks_trading(self, db, make_signal):
+        """Si total_pnl <= -bankroll, go_no_go_status devuelve account_balance_depleted."""
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(
+            db=db,
+            executor=executor,
+            initial_bankroll=100.0,
+            min_closed_trades=0,
+            min_win_rate=0.0,
+            min_total_pnl=-999.0,
+            max_drawdown_pct=2.0,  # drawdown check won't fire first
+        )
+
+        # Simulate total loss wiping the bankroll
+        manager.realized_pnl = -100.0
+        manager.total_pnl = -100.0
+
+        status = manager.go_no_go_status()
+
+        assert status.allowed is False
+        assert status.reason == "account_balance_depleted"
+
+    @pytest.mark.asyncio
+    async def test_account_balance_zero_exactly_blocks_trading(self, db, make_signal):
+        """El chequeo de capital es <= 0, entonces balance exactamente en 0 también bloquea."""
+        executor = PaperOrderExecutor(db=db, mode=TradeMode.DEMO)
+        manager = PositionManager(
+            db=db,
+            executor=executor,
+            initial_bankroll=100.0,
+            min_closed_trades=0,
+            min_win_rate=0.0,
+            min_total_pnl=-999.0,
+            max_drawdown_pct=2.0,
+        )
+
+        manager.realized_pnl = -100.0
+        manager.total_pnl = -100.0  # 100 - 100 == 0.0 → blocks
+
+        status = manager.go_no_go_status()
+
+        assert status.allowed is False
+        assert status.reason == "account_balance_depleted"

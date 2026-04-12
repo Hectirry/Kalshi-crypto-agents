@@ -6,17 +6,18 @@ Backtesting histórico sobre señales persistidas en SQLite.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 from math import isfinite
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.config import EngineCategoryOverride, EngineConfig
 from core.database import Database
 from core.interfaces import BacktestSource
 from core.models import Decision, Outcome, Signal
 from engine.ev_calculator import EVCalculator
-from engine.probability import classify_time_zone
+from engine.probability import TimeZone, classify_time_zone
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,17 @@ class EquityPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class ZoneMetrics:
+    """Métricas de backtest para una zona temporal (NEAR/MID/FAR) o franja horaria UTC."""
+
+    wins: int
+    losses: int
+    win_rate: float
+    total_pnl: float
+    avg_pnl: float
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestResult:
     """Resultado agregado del backtest."""
 
@@ -56,6 +68,9 @@ class BacktestResult:
     vectorbt_available: bool
     vectorbt_used: bool
     equity_curve: list[EquityPoint]
+    # Breakdowns por zona temporal (NEAR/MID/FAR) y por hora UTC (0-23)
+    results_by_zone: dict[str, ZoneMetrics] = field(default_factory=dict)
+    results_by_hour: dict[int, ZoneMetrics] = field(default_factory=dict)
 
 
 class BacktestRunner(BacktestSource):
@@ -141,6 +156,7 @@ class BacktestRunner(BacktestSource):
         losses = 0
         total_pnl = 0.0
         curve: list[EquityPoint] = []
+        signal_pnls: list[tuple[Signal, float]] = []
 
         for signal in actionable:
             pnl = self._trade_pnl(signal=signal)
@@ -156,6 +172,7 @@ class BacktestRunner(BacktestSource):
                     drawdown=drawdown,
                 )
             )
+            signal_pnls.append((signal, pnl))
             if pnl >= 0.0:
                 wins += 1
             else:
@@ -164,6 +181,7 @@ class BacktestRunner(BacktestSource):
         avg_pnl = total_pnl / len(actionable) if actionable else 0.0
         win_rate = wins / len(actionable) if actionable else 0.0
         max_drawdown = max((point.drawdown for point in curve), default=0.0)
+        by_zone, by_hour = self._build_breakdowns(signal_pnls)
 
         logger.info(
             "backtest_completed category=%s actionable=%s total_pnl=%.4f win_rate=%.4f",
@@ -188,6 +206,8 @@ class BacktestRunner(BacktestSource):
             vectorbt_available=vbt is not None,
             vectorbt_used=False,
             equity_curve=curve,
+            results_by_zone=by_zone,
+            results_by_hour=by_hour,
         )
 
     def categories_in_range(self, from_ts: float, to_ts: float) -> set[str]:
@@ -233,6 +253,7 @@ class BacktestRunner(BacktestSource):
         losses = 0
         total_pnl = 0.0
         curve: list[EquityPoint] = []
+        signal_pnls: list[tuple[Signal, float]] = []
 
         for signal in actionable:
             contract_price = self._contract_price(signal)
@@ -268,6 +289,7 @@ class BacktestRunner(BacktestSource):
                     drawdown=drawdown,
                 )
             )
+            signal_pnls.append((signal, pnl))
             if pnl >= 0.0:
                 wins += 1
             else:
@@ -276,6 +298,7 @@ class BacktestRunner(BacktestSource):
         avg_pnl = total_pnl / len(actionable) if actionable else 0.0
         win_rate = wins / len(actionable) if actionable else 0.0
         max_drawdown = max((point.drawdown for point in curve), default=0.0)
+        by_zone, by_hour = self._build_breakdowns(signal_pnls)
 
         logger.info(
             "vectorbt_backtest_completed category=%s actionable=%s total_pnl=%.4f win_rate=%.4f",
@@ -300,6 +323,46 @@ class BacktestRunner(BacktestSource):
             vectorbt_available=True,
             vectorbt_used=True,
             equity_curve=curve,
+            results_by_zone=by_zone,
+            results_by_hour=by_hour,
+        )
+
+    @staticmethod
+    def _build_breakdowns(
+        signal_pnls: list[tuple[Signal, float]],
+    ) -> tuple[dict[str, ZoneMetrics], dict[int, ZoneMetrics]]:
+        """
+        Construye breakdowns de PnL por zona temporal y por hora UTC.
+
+        Args:
+            signal_pnls: pares (señal, pnl_realizado) del backtest.
+
+        Returns:
+            Tupla (results_by_zone, results_by_hour) con métricas por grupo.
+        """
+        zone_groups: dict[str, list[float]] = {}
+        hour_groups: dict[int, list[float]] = {}
+        for signal, pnl in signal_pnls:
+            zone = classify_time_zone(signal.time_remaining_s)
+            zone_groups.setdefault(zone, []).append(pnl)
+            hour = datetime.datetime.fromtimestamp(signal.timestamp, tz=datetime.timezone.utc).hour
+            hour_groups.setdefault(hour, []).append(pnl)
+
+        def _metrics(pnls: list[float]) -> ZoneMetrics:
+            w = sum(1 for p in pnls if p >= 0.0)
+            total = sum(pnls)
+            n = len(pnls)
+            return ZoneMetrics(
+                wins=w,
+                losses=n - w,
+                win_rate=w / n,
+                total_pnl=total,
+                avg_pnl=total / n,
+            )
+
+        return (
+            {zone: _metrics(pnls) for zone, pnls in zone_groups.items()},
+            {hour: _metrics(pnls) for hour, pnls in hour_groups.items()},
         )
 
     @staticmethod
@@ -343,10 +406,14 @@ class BacktestRunner(BacktestSource):
             params.get("min_ev_threshold", self.config.min_ev_threshold),
             override.min_ev_threshold if override.min_ev_threshold is not None else self.config.min_ev_threshold,
         )
-        min_time = max(
+        base_time = max(
             self.config.min_time_remaining_s,
             override.min_time_remaining_s if override.min_time_remaining_s is not None else self.config.min_time_remaining_s,
         )
+        zone = classify_time_zone(signal.time_remaining_s)
+        zone_key = f"min_time_remaining_s_{zone}"
+        zone_raw = params.get(zone_key)
+        min_time = max(base_time, int(zone_raw)) if zone_raw is not None else base_time
         min_price = max(
             self.config.min_contract_price,
             override.min_contract_price if override.min_contract_price is not None else self.config.min_contract_price,
